@@ -10,8 +10,7 @@ Runs [ScoutSuite](https://github.com/nccgroup/ScoutSuite) against every AWS cred
 
 #### Usage
 
-
-    ./Scount-All-Accounts.sh [output_root_dir]
+    ./Scout-All-Accounts.sh [output_root_dir]
 
 - `output_root_dir` (optional): Directory where reports will be saved. Defaults to `./scoutsuite-reports`.
 
@@ -29,11 +28,12 @@ Runs [ScoutSuite](https://github.com/nccgroup/ScoutSuite) against every AWS cred
 
 #### Example
 
-``` bash
-    ./Scount-All-Accounts.sh
-    # or specify a custom output directory
-    ./Scount-All-Accounts.sh /tmp/pentest-reports
 ```
+./Scout-All-Accounts.sh
+# or specify a custom output directory
+./Scout-All-Accounts.sh /tmp/pentest-reports
+```
+
 ---
 
 ### MergeScoutReports.py
@@ -68,10 +68,43 @@ Merges multiple per-account ScoutSuite AWS reports into a single master report f
 
 ---
 
-## Contributing
+### MergeCloudfoxReports.py
 
-Contributions are welcome! Feel free to submit pull requests with additional scripts or improvements.
+Summarizes and cross-references multiple per-account [CloudFox](https://github.com/BishopFox/cloudfox) AWS reports (produced by `cloudfox aws --all-profiles`) into a single master triage report and recon roadmap.
 
-## License
+#### Usage
 
-MIT License
+    python3 MergeCloudfoxReports.py
+    python3 MergeCloudfoxReports.py ~/.cloudfox/cloudfox-output
+    python3 MergeCloudfoxReports.py /path/to/cloudfox-output -o ./master-report
+
+- By default, scans `~/.cloudfox/cloudfox-output` for CloudFox output folders.
+- The `-o` or `--output` option lets you specify the output directory (default: `<reports_dir>/master-report`).
+
+#### Output
+
+- `master_report.html`: Single-file, filterable/sortable HTML triage report.
+- `master_report.json`: Full aggregated data.
+- `account_summary.csv`: One row per account (modules run, resources seen, findings by severity).
+- `priority_findings.csv`: One row per flagged finding, across all accounts.
+- `module_row_counts.csv`: One row per (module, account): how many resources that module found.
+- `scan_targets.csv`: Deduplicated IPs/hostnames/URLs to feed a vuln scanner.
+- `s3_bucket_inventory.csv`: Every S3 bucket found, with an already_flagged column.
+- `lambda_inventory.csv`: Every Lambda function found, with an already_flagged column.
+- `ecr_inventory.csv`: Every ECR repo/image found.
+- `cloudformation_inventory.csv`: Stacks with Parameters/Outputs worth pulling manually.
+- `ec2_userdata_inventory.csv`: Instances with user data present (not the content itself).
+- `roadmap/loot/`: CloudFox's own per-account recon commands, merged across accounts.
+
+#### Requirements
+
+- Python 3
+- [alive-progress](https://github.com/rsalmei/alive-progress) for progress bars (`pip install alive-progress`)
+
+#### Example
+
+    python3 MergeCloudfoxReports.py
+    python3 MergeCloudfoxReports.py ~/.cloudfox/cloudfox-output -o ./master-report
+
+---
+
