@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
-MergeCloudfoxReports.py.py
+MergeCloudfoxReports.py
 
 Summarize and cross-reference multiple per-account CloudFox AWS reports
 (produced by `cloudfox aws --all-profiles`) into one master triage report
-for a pentester.
+for a pentester, PLUS a "recon roadmap" of things worth investigating next
+that aren't security findings by themselves.
 
 CloudFox (as of the current release) writes output like this:
 
     <outdir>/cloudfox-output/aws/<profile>-<accountID>/
         csv/    <module>.csv    (one file per module, e.g. buckets.csv, secrets.csv, ...)
         table/  <module>.txt    (human-readable ASCII tables - not parsed by this script)
-        loot/   <name>.txt      (free-form pullable command lists / dumped data)
+        loot/   <name>.txt      (free-form pullable command lists / dumped data -
+                                  CloudFox itself already writes ready-to-run AWS CLI
+                                  commands here for things like pulling Lambda code,
+                                  ECR images, S3 bucket contents, secrets, etc.)
 
 By default CloudFox writes to ~/.cloudfox/cloudfox-output, so that is the
 default here too (matching what `cloudfox aws --all-profiles` produces with
@@ -19,16 +23,17 @@ no --outdir override).
 
 This script does NOT restate all of the raw data - each account's original
 CSV/table/loot output is still the source of truth for deep investigation.
-Instead it:
+Instead it does two things:
 
+PART 1 - Security findings triage (heuristic, not exhaustive):
   1. Walks every "<profile>-<accountID>" folder it can find under the given
      root (so it works whether you point it at cloudfox-output/, .cloudfox/,
      or a custom --outdir).
   2. Reads every module CSV for that account and tallies how many resources
      each module enumerated.
   3. Flags rows worth a pentester's attention using two kinds of heuristics:
-       - column-name heuristics (a column called "Public?", "External",
-         "Anonymous", etc. with a truthy value)
+       - column-name heuristics (a column called "Public?", "IsAdminRole?",
+         "CanPrivEscToAdmin?", "External...", etc. with a truthy value)
        - text-pattern heuristics (0.0.0.0/0, ::/0, AdministratorAccess,
          wildcard IAM principals/actions, iam:PassRole, etc. anywhere in a row)
      plus a short list of modules where CloudFox's whole purpose IS the
@@ -43,20 +48,49 @@ Instead it:
      that repeat account-to-account (e.g. "12 of 40 accounts have a
      publicly readable S3 bucket") jump out immediately.
 
+PART 2 - Recon roadmap (not findings - things to go investigate next):
+  6. Builds a deduplicated list of externally/internally facing IPs,
+     hostnames, and URLs pulled from instances/ENIs/databases/endpoints/
+     API Gateways/Route53, meant to be fed straight into a vulnerability
+     scanner (scan_targets.csv).
+  7. Builds inventories of S3 buckets, Lambda functions, and ECR repos
+     across every account, marked with whether each one was already
+     surfaced in the findings above (so you know what's genuinely
+     unexamined vs. already flagged).
+  8. Builds a list of CloudFormation stacks that have Parameters/Outputs
+     worth pulling, and EC2 instances that have user data present -
+     without copying the actual parameter/output/user-data content into
+     this report (that content can carry real secrets; go read the
+     account's own loot/cloudformation-data.txt or loot/instance-userdata.txt).
+  9. Merges CloudFox's own per-account loot/*.txt command files (bucket
+     pulls, Lambda code downloads, ECR pulls, EKS kubeconfigs, SNS/SQS
+     commands, secrets retrieval commands, SSM/EC2-Instance-Connect
+     commands, public/private IP lists, DNS records, endpoint URLs, ...)
+     into one file per command type under roadmap/loot/, each section
+     labeled with the account it came from. These are CloudFox's own
+     generated commands, just consolidated - nothing new is invented here.
+
 This is heuristic triage, not a complete audit - always go back to the
 account's own csv/table/loot files for anything this script doesn't flag.
 
 Outputs (written to --output, default "<reports_dir>/master-report"):
-  master_report.json        full aggregated data
-  account_summary.csv       one row per account: modules run, resources seen, findings by severity
-  priority_findings.csv     one row per flagged finding, across all accounts
-  module_row_counts.csv     one row per (module, account): how many resources that module found
-  master_report.html        single-file, filterable/sortable HTML triage report
+  master_report.html             single-file, filterable/sortable HTML triage report
+  master_report.json             full aggregated data
+  account_summary.csv            one row per account: modules run, resources seen, findings by severity
+  priority_findings.csv          one row per flagged finding, across all accounts
+  module_row_counts.csv          one row per (module, account): how many resources that module found
+  scan_targets.csv               deduplicated IPs/hostnames/URLs to feed a vuln scanner
+  s3_bucket_inventory.csv        every S3 bucket found, with an already_flagged column
+  lambda_inventory.csv           every Lambda function found, with an already_flagged column
+  ecr_inventory.csv              every ECR repo/image found
+  cloudformation_inventory.csv   stacks with Parameters/Outputs worth pulling manually
+  ec2_userdata_inventory.csv     instances with user data present (not the content itself)
+  roadmap/loot/<name>.txt        CloudFox's own per-account recon commands, merged across accounts
 
 Usage:
-  python3 MergeCloudfoxReports.py.py
-  python3 MergeCloudfoxReports.py.py ~/.cloudfox/cloudfox-output
-  python3 MergeCloudfoxReports.py.py /path/to/cloudfox-output -o ./master-report
+  python3 MergeCloudfoxReports.py
+  python3 MergeCloudfoxReports.py ~/.cloudfox/cloudfox-output
+  python3 MergeCloudfoxReports.py /path/to/cloudfox-output -o ./master-report
 
 Requires: alive-progress (pip install alive-progress)
 """
@@ -68,6 +102,7 @@ import json
 import os
 import re
 import sys
+from collections import defaultdict
 
 try:
     from alive_progress import alive_bar
@@ -96,7 +131,12 @@ ALWAYS_FLAG_MODULES = {
 
 # Column-name heuristics: a column whose header matches one of these
 # (case-insensitive) is treated as a risk flag when its value looks truthy.
-RISK_COLUMN_PATTERNS = ['public', 'external', 'anonymous', 'exposed', 'insecure', 'unauthenticated']
+# 'admin'/'privesc' catch CloudFox's own "IsAdminRole?" / "CanPrivEscToAdmin?"
+# columns, which appear on instances, lambda, ecs-tasks, eks, codebuild,
+# principals, workloads, and pmapper - one of the highest-signal columns
+# CloudFox produces.
+RISK_COLUMN_PATTERNS = ['public', 'external', 'anonymous', 'exposed', 'insecure',
+                         'unauthenticated', 'admin', 'privesc']
 TRUTHY_VALUES = {'yes', 'y', 'true', '1', 'public'}
 
 # Column-agnostic text patterns: matched against every cell's text. Order
@@ -138,6 +178,113 @@ IDENTIFIER_COLUMNS = [
 
 SEVERITY_ORDER = {'high': 3, 'medium': 2, 'low': 1}
 
+# ---------------------------------------------------------------------------
+# Recon roadmap configuration
+# ---------------------------------------------------------------------------
+
+# Modules we keep full rows for (not just counts/findings) so we can build
+# standalone inventories of them, cross-referenced against findings above.
+INVENTORY_MODULES = {'buckets', 'lambda', 'ecr', 'cloudformation'}
+
+# Loot files that can contain actual extracted VALUES (CloudFormation stack
+# parameters/outputs, decoded EC2 user data) rather than just resource
+# identifiers or ready-to-run commands. These are inventoried (presence,
+# size, identifiers) but never merged verbatim - go read the account's own
+# copy for the actual content.
+SUMMARY_ONLY_LOOT_FILES = {'instance-userdata.txt', 'cloudformation-data.txt'}
+
+# Per-module extractors for scan_targets.csv: given a lowercase-keyed row,
+# return a list of (target, target_type, public, context) tuples. 'public'
+# is 'true' / 'false' / 'unknown' (a string, not bool, so a genuinely-unknown
+# value never silently collapses to False when merged across sources).
+
+
+def _extract_instances(row):
+    out = []
+    name = row.get('name', '')
+    ext = (row.get('external ip') or '').strip()
+    if ext and ext.lower() not in ('', 'none', 'n/a', 'null'):
+        out.append((ext, 'ip', 'true', f'EC2 instance {name}'.strip()))
+    inte = (row.get('internal ip') or '').strip()
+    if inte and inte.lower() not in ('', 'none', 'n/a', 'null'):
+        out.append((inte, 'ip', 'false', f'EC2 instance {name}'.strip()))
+    return out
+
+
+def _extract_eni(row):
+    out = []
+    ident = row.get('id', '')
+    ext = (row.get('external ip') or '').strip()
+    if ext and ext.lower() not in ('', 'none', 'n/a', 'null'):
+        out.append((ext, 'ip', 'true', f'ENI {ident}'.strip()))
+    inte = (row.get('internal ip') or '').strip()
+    if inte and inte.lower() not in ('', 'none', 'n/a', 'null'):
+        out.append((inte, 'ip', 'false', f'ENI {ident}'.strip()))
+    return out
+
+
+def _extract_databases(row):
+    ep = (row.get('endpoint') or '').strip()
+    if not ep:
+        return []
+    port = (row.get('port') or '').strip()
+    target = f'{ep}:{port}' if port else ep
+    engine = row.get('engine', '')
+    name = row.get('name', '')
+    return [(target, 'hostname', 'unknown', f'{engine} database {name}'.strip())]
+
+
+def _extract_endpoints(row):
+    ep = (row.get('endpoint') or '').strip()
+    if not ep:
+        return []
+    public = 'true' if (row.get('public') or '').strip().lower() in TRUTHY_VALUES else 'false'
+    service = row.get('service', '')
+    return [(ep, 'hostname', public, f'{service} endpoint'.strip())]
+
+
+def _extract_api_gw(row):
+    ep = (row.get('endpoint') or '').strip()
+    if not ep:
+        return []
+    public = 'true' if (row.get('public') or '').strip().lower() in TRUTHY_VALUES else 'false'
+    name = row.get('name', '')
+    return [(ep, 'url', public, f'API Gateway {name}'.strip())]
+
+
+def _extract_route53(row):
+    out = []
+    rtype = (row.get('type') or '').strip().upper()
+    if rtype not in ('A', 'AAAA', 'CNAME'):
+        return out
+    private = (row.get('privatezone') or '').strip().lower() in TRUTHY_VALUES
+    public = 'false' if private else 'true'
+    name = (row.get('name') or '').strip()
+    value = (row.get('value') or '').strip()
+    if name:
+        out.append((name, 'hostname', public, f'Route53 {rtype} record'))
+    if value and value != name:
+        out.append((value, 'hostname-or-ip', public, f'Route53 {rtype} record value'))
+    return out
+
+
+TARGET_EXTRACTORS = {
+    'instances': _extract_instances,
+    'elastic-network-interfaces': _extract_eni,
+    'databases': _extract_databases,
+    'endpoints': _extract_endpoints,
+    'api-gw': _extract_api_gw,
+    'route53': _extract_route53,
+}
+
+USERDATA_BLOCK_RE = re.compile(
+    r'Instance Arn:\s*(?P<arn>\S+)\s*\n'
+    r'Region:\s*(?P<region>\S+)\s*\n'
+    r'Instance Profile:\s*(?P<profile>.*?)\s*\n\s*\n'
+    r'User Data:\s*\n(?P<userdata>.*?)(?=\n=+\s*\n|\Z)',
+    re.DOTALL,
+)
+
 
 def discover_account_dirs(root):
     """Find every '<profile>-<accountID>' folder under root that has csv/ or table/ output."""
@@ -167,10 +314,14 @@ def pick_identifier(row_lower_map, fallback_row):
 
 
 def scan_csv_module(csv_path, module_name, account):
-    """Read one module CSV, return (row_count, findings)."""
+    """Read one module CSV. Returns (row_count, findings, targets, inventory_rows)."""
     findings = []
+    targets = []
+    inventory_rows = []
     row_count = 0
     always_flag = next((v for kw, v in ALWAYS_FLAG_MODULES.items() if kw in module_name), None)
+    extractor = TARGET_EXTRACTORS.get(module_name)
+    keep_inventory = module_name in INVENTORY_MODULES
 
     try:
         with open(csv_path, newline='', encoding='utf-8', errors='replace') as f:
@@ -180,6 +331,16 @@ def scan_csv_module(csv_path, module_name, account):
                 row = {k: (v or '') for k, v in row.items() if k is not None}
                 row_lower = {(k or '').strip().lower(): v for k, v in row.items()}
                 identifier = pick_identifier(row_lower, row)
+
+                if extractor:
+                    for target, ttype, public, context in extractor(row_lower):
+                        targets.append({
+                            'target': target, 'target_type': ttype, 'public': public,
+                            'source_module': module_name, 'context': context,
+                        })
+
+                if keep_inventory:
+                    inventory_rows.append({'_identifier': identifier, **row_lower})
 
                 if always_flag:
                     category, severity = always_flag
@@ -220,9 +381,9 @@ def scan_csv_module(csv_path, module_name, account):
             'account_profile': account['profile'], 'account_id': account['account_id'],
             'module': module_name, 'category': 'parse-error', 'severity': 'low',
             'identifier': os.path.basename(csv_path), 'detail': str(e),
-        }]
+        }], [], []
 
-    return row_count, findings
+    return row_count, findings, targets, inventory_rows
 
 
 def scan_loot(loot_dir, account):
@@ -264,26 +425,63 @@ def scan_loot(loot_dir, account):
     return inventory, findings
 
 
-def collect_account(account, include_module_counts_only=False):
+def scan_instance_userdata(loot_dir, account):
+    """Parse loot/instance-userdata.txt for which instances have user data - not the content itself."""
+    path = os.path.join(loot_dir, 'instance-userdata.txt')
+    targets = []
+    if not os.path.isfile(path):
+        return targets
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            content = f.read()
+    except Exception:
+        return targets
+    for m in USERDATA_BLOCK_RE.finditer(content):
+        targets.append({
+            'account_profile': account['profile'], 'account_id': account['account_id'],
+            'instance_arn': m.group('arn'), 'region': m.group('region'),
+            'instance_profile': m.group('profile').strip(),
+            'userdata_bytes': len(m.group('userdata').encode('utf-8', errors='replace')),
+        })
+    return targets
+
+
+def collect_account(account):
     csv_dir = os.path.join(account['dir'], 'csv')
     modules = {}
     findings = []
+    targets = []
+    inventory = defaultdict(list)
 
     if os.path.isdir(csv_dir):
         for fname in sorted(os.listdir(csv_dir)):
             if not fname.endswith('.csv'):
                 continue
             module_name = fname[:-4]
-            row_count, module_findings = scan_csv_module(os.path.join(csv_dir, fname), module_name, account)
+            row_count, module_findings, module_targets, module_inventory = scan_csv_module(
+                os.path.join(csv_dir, fname), module_name, account)
             modules[module_name] = row_count
             findings.extend(module_findings)
+            for t in module_targets:
+                t['account_profile'] = account['profile']
+                t['account_id'] = account['account_id']
+                targets.append(t)
+            if module_inventory:
+                inventory[module_name] = module_inventory
 
-    loot_inventory, loot_findings = scan_loot(os.path.join(account['dir'], 'loot'), account)
+    loot_dir = os.path.join(account['dir'], 'loot')
+    loot_inventory, loot_findings = scan_loot(loot_dir, account)
     findings.extend(loot_findings)
+    userdata_targets = scan_instance_userdata(loot_dir, account)
 
     severity_counts = {'high': 0, 'medium': 0, 'low': 0}
     for f in findings:
         severity_counts[f.get('severity', 'low')] = severity_counts.get(f.get('severity', 'low'), 0) + 1
+
+    # (module, identifier-lowercased) pairs already surfaced as findings, so
+    # the roadmap inventories below can mark "already covered above" instead
+    # of repeating it as if it were new.
+    flagged_keys = {(f['module'], (f['identifier'] or '').strip().lower()) for f in findings}
 
     return {
         'profile': account['profile'],
@@ -294,6 +492,10 @@ def collect_account(account, include_module_counts_only=False):
         'loot_inventory': loot_inventory,
         'findings': findings,
         'severity_counts': severity_counts,
+        'targets': targets,
+        'inventory': inventory,
+        'userdata_targets': userdata_targets,
+        'flagged_keys': flagged_keys,
     }
 
 
@@ -347,6 +549,178 @@ def build_finding_index(accounts):
     return index
 
 
+# ---------------------------------------------------------------------------
+# Recon roadmap: scan targets + inventories + merged loot commands
+# ---------------------------------------------------------------------------
+
+def build_scan_targets(accounts):
+    """Dedup (account, target) across every module that contributed it."""
+    dedup = {}
+    for a in accounts:
+        for t in a['targets']:
+            key = (t['account_id'], t['target'])
+            entry = dedup.setdefault(key, {
+                'account_profile': t['account_profile'], 'account_id': t['account_id'],
+                'target': t['target'], 'target_type': t['target_type'],
+                'public': 'unknown', 'source_modules': set(), 'context': set(),
+            })
+            entry['source_modules'].add(t['source_module'])
+            entry['context'].add(t['context'])
+            if t['public'] == 'true':
+                entry['public'] = 'true'
+            elif t['public'] == 'false' and entry['public'] != 'true':
+                entry['public'] = 'false'
+
+    result = []
+    for entry in dedup.values():
+        entry['source_modules'] = ', '.join(sorted(entry['source_modules']))
+        entry['context'] = '; '.join(sorted(c for c in entry['context'] if c))
+        result.append(entry)
+    result.sort(key=lambda e: (e['public'] != 'true', e['account_profile'], e['target']))
+    return result
+
+
+def write_scan_targets_csv(path, targets):
+    fields = ['target', 'target_type', 'public', 'account_profile', 'account_id', 'source_modules', 'context']
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(fields)
+        for t in targets:
+            w.writerow([t['target'], t['target_type'], t['public'], t['account_profile'],
+                        t['account_id'], t['source_modules'], t['context']])
+
+
+def write_bucket_inventory_csv(path, accounts):
+    fields = ['account_profile', 'account_id', 'name', 'region', 'public', 'resource_policy_summary', 'already_flagged']
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(fields)
+        n = 0
+        for a in accounts:
+            for row in a['inventory'].get('buckets', []):
+                already = ('buckets', row['_identifier'].strip().lower()) in a['flagged_keys']
+                w.writerow([a['profile'], a['account_id'], row.get('name', ''), row.get('region', ''),
+                            row.get('public?', row.get('public', '')), row.get('resource policy summary', ''),
+                            already])
+                n += 1
+        return n
+
+
+def write_lambda_inventory_csv(path, accounts):
+    fields = ['account_profile', 'account_id', 'name', 'arn', 'role', 'is_admin_role',
+              'can_privesc_to_admin', 'already_flagged']
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(fields)
+        n = 0
+        for a in accounts:
+            for row in a['inventory'].get('lambda', []):
+                already = ('lambda', row['_identifier'].strip().lower()) in a['flagged_keys']
+                w.writerow([a['profile'], a['account_id'], row.get('name', ''), row.get('arn', ''),
+                            row.get('role', ''), row.get('isadminrole?', ''), row.get('canprivesctoadmin?', ''),
+                            already])
+                n += 1
+        return n
+
+
+def write_ecr_inventory_csv(path, accounts):
+    fields = ['account_profile', 'account_id', 'name', 'uri', 'pushed_at', 'image_tags', 'image_size']
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(fields)
+        n = 0
+        for a in accounts:
+            for row in a['inventory'].get('ecr', []):
+                w.writerow([a['profile'], a['account_id'], row.get('name', ''), row.get('uri', ''),
+                            row.get('pushedat', ''), row.get('imagetags', ''), row.get('imagesize', '')])
+                n += 1
+        return n
+
+
+def write_cloudformation_inventory_csv(path, accounts):
+    fields = ['account_profile', 'account_id', 'stack_name', 'region', 'role',
+              'has_parameters', 'has_outputs', 'already_flagged']
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(fields)
+        n = 0
+        for a in accounts:
+            for row in a['inventory'].get('cloudformation', []):
+                has_params = bool((row.get('parameters') or '').strip())
+                has_outputs = bool((row.get('outputs') or '').strip())
+                if not (has_params or has_outputs):
+                    continue  # nothing worth pulling for this stack
+                already = ('cloudformation', row['_identifier'].strip().lower()) in a['flagged_keys']
+                w.writerow([a['profile'], a['account_id'], row.get('name', ''), row.get('region', ''),
+                            row.get('role', ''), has_params, has_outputs, already])
+                n += 1
+        return n
+
+
+def write_ec2_userdata_csv(path, accounts):
+    fields = ['account_profile', 'account_id', 'instance_arn', 'region', 'instance_profile', 'userdata_bytes']
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(fields)
+        n = 0
+        for a in accounts:
+            for t in a['userdata_targets']:
+                w.writerow([t['account_profile'], t['account_id'], t['instance_arn'], t['region'],
+                            t['instance_profile'], t['userdata_bytes']])
+                n += 1
+        return n
+
+
+def merge_loot_files(accounts, output_dir):
+    """Merge CloudFox's own per-account loot/*.txt command files across accounts.
+
+    These are CloudFox-generated ready-to-run recon commands (bucket pulls,
+    Lambda code downloads, ECR pulls, EKS kubeconfigs, SNS/SQS commands,
+    secrets retrieval, SSM/EC2-Instance-Connect commands, public/private IP
+    lists, DNS records, endpoint URLs, ...). Files in SUMMARY_ONLY_LOOT_FILES
+    are skipped here (they're inventoried elsewhere without their content,
+    since they can carry actual secret/parameter values).
+    """
+    grouped = defaultdict(list)
+    for a in accounts:
+        loot_dir = os.path.join(a['dir'], 'loot')
+        if not os.path.isdir(loot_dir):
+            continue
+        for fname in sorted(os.listdir(loot_dir)):
+            if fname in SUMMARY_ONLY_LOOT_FILES or not fname.endswith('.txt'):
+                continue
+            fpath = os.path.join(loot_dir, fname)
+            if not os.path.isfile(fpath):
+                continue
+            try:
+                with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                    content = f.read().rstrip('\n')
+            except Exception:
+                continue
+            if not content.strip():
+                continue
+            grouped[fname].append((f"{a['profile']}-{a['account_id']}", content))
+
+    roadmap_dir = os.path.join(output_dir, 'roadmap', 'loot')
+    os.makedirs(roadmap_dir, exist_ok=True)
+    summary = {}
+    for fname, entries in sorted(grouped.items()):
+        out_lines = [
+            f"# {fname} - merged from {len(entries)} account(s) by MergeCloudfoxReports.py",
+            "# Content is CloudFox's own per-account output; only the merge is new.",
+            "",
+        ]
+        for acct_label, content in entries:
+            out_lines.append(f"########## ACCOUNT: {acct_label} ##########")
+            out_lines.append(content)
+            out_lines.append("")
+        out_path = os.path.join(roadmap_dir, fname)
+        with open(out_path, 'w', encoding='utf-8') as f:
+            f.write("\n".join(out_lines))
+        summary[fname] = {'accounts': len(entries), 'bytes': os.path.getsize(out_path)}
+    return summary
+
+
 HTML_TEMPLATE = """<!doctype html>
 <html lang="en">
 <head>
@@ -395,6 +769,9 @@ HTML_TEMPLATE = """<!doctype html>
   input[type=text] { flex: 1; min-width: 200px; }
   .count-pill { font-size: 0.78rem; color: var(--muted); margin-left: 6px; }
   .muted { color: var(--muted); font-size: 0.85rem; }
+  .roadmap-note { font-size: 0.85rem; color: var(--muted); margin: 0 0 12px; }
+  td a, .roadmap-note a { color: var(--accent); text-decoration: none; }
+  td a:hover, .roadmap-note a:hover { text-decoration: underline; }
 </style>
 </head>
 <body>
@@ -452,6 +829,19 @@ HTML_TEMPLATE = """<!doctype html>
       </thead>
       <tbody></tbody>
     </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>Recon roadmap <span class="muted">(not findings - things to investigate next)</span></h2>
+    <p class="roadmap-note">These aren't security issues by themselves - they're what's left to check. Full detail is in the linked CSV/text files next to this report, not restated here.</p>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Artifact</th><th>What it is</th><th>Count</th></tr></thead>
+        <tbody>
+__ROADMAP_ROWS__
+        </tbody>
+      </table>
     </div>
   </section>
 
@@ -606,7 +996,38 @@ renderMatrix();
 """
 
 
-def render_html(accounts, finding_index):
+def render_roadmap_rows(roadmap_counts):
+    """Server-rendered (non-JS) table rows for the recon roadmap section."""
+    descriptions = {
+        'scan_targets.csv': ('External/internal IPs, hostnames, and URLs enumerated - '
+                              'feed straight into your vulnerability scanner.'),
+        's3_bucket_inventory.csv': ('Every S3 bucket found. "already_flagged" marks the ones the '
+                                    'findings above already cover; the rest are unexamined.'),
+        'lambda_inventory.csv': ('Every Lambda function found, with IsAdminRole?/CanPrivEscToAdmin? '
+                                  'carried through for quick triage.'),
+        'ecr_inventory.csv': 'Every ECR repository/image found.',
+        'cloudformation_inventory.csv': ('Stacks with Parameters or Outputs worth pulling manually - '
+                                          'actual values are NOT duplicated here, see each account\'s own '
+                                          'loot/cloudformation-data.txt.'),
+        'ec2_userdata_inventory.csv': ('Instances that have user data present - the decoded content is '
+                                        'NOT duplicated here, see each account\'s own loot/instance-userdata.txt.'),
+        'roadmap/loot/': ('CloudFox\'s own ready-to-run recon commands (bucket pulls, Lambda/ECR pulls, '
+                           'EKS kubeconfigs, secrets retrieval, SSM/EC2-Instance-Connect, IP/DNS lists, ...), '
+                           'merged across every account, one file per command type.'),
+    }
+    rows = []
+    for fname, count in roadmap_counts.items():
+        if count == 0:
+            continue
+        desc = descriptions.get(fname, '')
+        rows.append(
+            f'<tr><td><a href="{html.escape(fname)}">{html.escape(fname)}</a></td>'
+            f'<td class="wrap">{html.escape(desc)}</td><td>{count}</td></tr>'
+        )
+    return '\n'.join(rows) if rows else '<tr><td colspan="3" class="muted">Nothing to report.</td></tr>'
+
+
+def render_html(accounts, finding_index, roadmap_counts):
     flat_accounts = [{
         'profile': a['profile'], 'account_id': a['account_id'],
         'modules_run': len(a['modules']), 'total_resources': a['total_resources'],
@@ -640,6 +1061,7 @@ def render_html(accounts, finding_index):
     out = out.replace('__ACCOUNTS_JSON__', dump(flat_accounts))
     out = out.replace('__FINDINGS_JSON__', dump(flat_findings))
     out = out.replace('__MATRIX_JSON__', dump(matrix))
+    out = out.replace('__ROADMAP_ROWS__', render_roadmap_rows(roadmap_counts))
     return out
 
 
@@ -672,6 +1094,57 @@ def main():
             accounts.append(collect_account(acct))
             bar()
 
+    roadmap_counts = {}
+    scan_targets_holder = {}
+
+    def _build_scan_targets():
+        scan_targets_holder['targets'] = build_scan_targets(accounts)
+
+    def _write_scan_targets():
+        targets = scan_targets_holder['targets']
+        write_scan_targets_csv(os.path.join(output_dir, 'scan_targets.csv'), targets)
+        roadmap_counts['scan_targets.csv'] = len(targets)
+
+    def _write_bucket_inventory():
+        roadmap_counts['s3_bucket_inventory.csv'] = write_bucket_inventory_csv(
+            os.path.join(output_dir, 's3_bucket_inventory.csv'), accounts)
+
+    def _write_lambda_inventory():
+        roadmap_counts['lambda_inventory.csv'] = write_lambda_inventory_csv(
+            os.path.join(output_dir, 'lambda_inventory.csv'), accounts)
+
+    def _write_ecr_inventory():
+        roadmap_counts['ecr_inventory.csv'] = write_ecr_inventory_csv(
+            os.path.join(output_dir, 'ecr_inventory.csv'), accounts)
+
+    def _write_cloudformation_inventory():
+        roadmap_counts['cloudformation_inventory.csv'] = write_cloudformation_inventory_csv(
+            os.path.join(output_dir, 'cloudformation_inventory.csv'), accounts)
+
+    def _write_userdata_inventory():
+        roadmap_counts['ec2_userdata_inventory.csv'] = write_ec2_userdata_csv(
+            os.path.join(output_dir, 'ec2_userdata_inventory.csv'), accounts)
+
+    def _merge_loot():
+        loot_summary = merge_loot_files(accounts, output_dir)
+        roadmap_counts['roadmap/loot/'] = len(loot_summary)
+
+    roadmap_steps = [
+        ('cross-referencing scan targets across accounts', _build_scan_targets),
+        ('writing scan_targets.csv', _write_scan_targets),
+        ('writing s3_bucket_inventory.csv', _write_bucket_inventory),
+        ('writing lambda_inventory.csv', _write_lambda_inventory),
+        ('writing ecr_inventory.csv', _write_ecr_inventory),
+        ('writing cloudformation_inventory.csv', _write_cloudformation_inventory),
+        ('writing ec2_userdata_inventory.csv', _write_userdata_inventory),
+        ('merging per-account loot commands', _merge_loot),
+    ]
+    with alive_bar(len(roadmap_steps), title='Building recon roadmap') as bar:
+        for label, step in roadmap_steps:
+            bar.text = f'-> {label}'
+            step()
+            bar()
+
     finding_index = {}
 
     def _build_index():
@@ -679,9 +1152,10 @@ def main():
         finding_index = build_finding_index(accounts)
 
     def _write_json():
-        master = {'accounts': accounts, 'findings_by_category': finding_index}
+        master = {'accounts': accounts, 'findings_by_category': finding_index,
+                   'scan_targets': scan_targets_holder['targets']}
         with open(os.path.join(output_dir, 'master_report.json'), 'w', encoding='utf-8') as f:
-            json.dump(master, f, indent=2, sort_keys=True)
+            json.dump(master, f, indent=2, sort_keys=True, default=lambda o: list(o) if isinstance(o, set) else str(o))
 
     def _write_account_csv():
         write_account_summary_csv(os.path.join(output_dir, 'account_summary.csv'), accounts)
@@ -694,7 +1168,7 @@ def main():
 
     def _write_html():
         with open(os.path.join(output_dir, 'master_report.html'), 'w', encoding='utf-8') as f:
-            f.write(render_html(accounts, finding_index))
+            f.write(render_html(accounts, finding_index, roadmap_counts))
 
     report_steps = [
         ('cross-referencing findings across accounts', _build_index),
@@ -715,9 +1189,12 @@ def main():
     total_medium = sum(a['severity_counts']['medium'] for a in accounts)
     print(f"Merged {len(accounts)} account(s): {total_resources} resources enumerated, "
           f"{total_high} high / {total_medium} medium severity findings flagged.")
+    print(f"Recon roadmap: {roadmap_counts}")
     print(f"Output written to: {output_dir}")
     for fname in ('master_report.html', 'master_report.json', 'account_summary.csv',
-                  'priority_findings.csv', 'module_row_counts.csv'):
+                  'priority_findings.csv', 'module_row_counts.csv', 'scan_targets.csv',
+                  's3_bucket_inventory.csv', 'lambda_inventory.csv', 'ecr_inventory.csv',
+                  'cloudformation_inventory.csv', 'ec2_userdata_inventory.csv', 'roadmap/loot/'):
         print(f"  - {os.path.join(output_dir, fname)}")
 
 
