@@ -4,11 +4,12 @@ This repository contains a collection of helper scripts to assist with cloud pen
 
 ## Included Scripts
 
-### Scount-All-Accounts.sh
+### Scout-All-Accounts.sh
 
 Runs [ScoutSuite](https://github.com/nccgroup/ScoutSuite) against every AWS credential profile found in your `~/.aws/credentials` file, saving each report in a separate folder named after the profile.
 
 #### Usage
+
 
     ./Scount-All-Accounts.sh [output_root_dir]
 
@@ -28,9 +29,44 @@ Runs [ScoutSuite](https://github.com/nccgroup/ScoutSuite) against every AWS cred
 
 #### Example
 
+``` bash
     ./Scount-All-Accounts.sh
     # or specify a custom output directory
     ./Scount-All-Accounts.sh /tmp/pentest-reports
+```
+---
+
+### MergeScoutReports.py
+
+Merges multiple per-account ScoutSuite AWS reports into a single master report for easier cross-account analysis.
+
+#### Usage
+
+    python3 MergeScoutReports.py ./scoutsuite-reports
+    python3 MergeScoutReports.py ./scoutsuite-reports -o ./master-report
+    python3 MergeScoutReports.py ./scoutsuite-reports --include-clean
+
+- The script expects a parent directory containing one subfolder per account/profile, each with a ScoutSuite report (as produced by `Scout-All-Accounts.sh`).
+- The `-o` or `--output` option lets you specify the output directory (default: `<reports_dir>/master-report`).
+- The `--include-clean` flag includes rules with zero flagged items in the output.
+
+#### Output
+
+- `master_report.json`: Full aggregated data (per-account and cross-account).
+- `account_summary.csv`: One row per account with totals.
+- `findings_detail.csv`: One row per (account, flagged finding).
+- `master_report.html`: Single-file, filterable/sortable HTML report.
+
+#### Requirements
+
+- Python 3
+- [alive-progress](https://github.com/rsalmei/alive-progress) for progress bars (`pip install alive-progress`)
+
+#### Example
+
+    python3 MergeScoutReports.py ./scoutsuite-reports
+
+---
 
 ## Contributing
 
