@@ -10,7 +10,7 @@ Runs [ScoutSuite](https://github.com/nccgroup/ScoutSuite) against every AWS cred
 
 #### Usage
 
-    ./Scout-All-Accounts.sh [output_root_dir]
+    ./Scount-All-Accounts.sh [output_root_dir]
 
 - `output_root_dir` (optional): Directory where reports will be saved. Defaults to `./scoutsuite-reports`.
 
@@ -27,18 +27,17 @@ Runs [ScoutSuite](https://github.com/nccgroup/ScoutSuite) against every AWS cred
 - Saves each report under `output_root_dir/<profile-name>/`.
 
 #### Example
-
 ```
-./Scout-All-Accounts.sh
-# or specify a custom output directory
-./Scout-All-Accounts.sh /tmp/pentest-reports
+./Scount-All-Accounts.sh
+or specify a custom output directory
+./Scount-All-Accounts.sh /tmp/pentest-reports
 ```
 
 ---
 
 ### MergeScoutReports.py
 
-Merges multiple per-account ScoutSuite AWS reports into a single master report for easier cross-account analysis.
+Merges multiple per-account ScoutSuite AWS reports into one master report for cross-account analysis.
 
 #### Usage
 
@@ -54,7 +53,8 @@ Merges multiple per-account ScoutSuite AWS reports into a single master report f
 
 - `master_report.json`: Full aggregated data (per-account and cross-account).
 - `account_summary.csv`: One row per account with totals.
-- `findings_detail.csv`: One row per (account, flagged finding).
+- `findings_detail.csv`: One row per (account, flagged finding) - rule-level rollup.
+- `findings_items_detail.csv`: One row per (account, flagged finding, flagged resource) - granular resource-level detail.
 - `master_report.html`: Single-file, filterable/sortable HTML report.
 
 #### Requirements
@@ -107,4 +107,42 @@ Summarizes and cross-references multiple per-account [CloudFox](https://github.c
     python3 MergeCloudfoxReports.py ~/.cloudfox/cloudfox-output -o ./master-report
 
 ---
+
+### MergeLambdaScannerReports.py
+
+Merges and summarizes multiple per-account LambdaScanner AWS reports into a single master report for easier triage and cross-account analysis.
+
+#### Usage
+
+    python3 MergeLambdaScannerReports.py <input_dir> [-o <output_dir>]
+
+- The script expects a directory containing LambdaScanner JSON reports for each account.
+- The `-o` or `--output` option lets you specify the output directory (default: `<input_dir>/master-report`).
+
+#### Output
+
+- `master_report.html`: Single-file, filterable/sortable HTML triage report.
+- `master_report.json`: Full aggregated data.
+- `account_summary.csv`: One row per account with summary statistics.
+- `findings_detail.csv`: One row per flagged finding, across all accounts.
+
+#### Requirements
+
+- Python 3
+- [alive-progress](https://github.com/rsalmei/alive-progress) for progress bars (`pip install alive-progress`)
+
+#### Example
+
+    python3 MergeLambdaScannerReports.py ./lambdascanner-reports
+    python3 MergeLambdaScannerReports.py ./lambdascanner-reports -o ./master-report
+
+---
+
+## Contributing
+
+Contributions are welcome! Feel free to submit pull requests with additional scripts or improvements.
+
+## License
+
+MIT License
 
