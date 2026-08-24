@@ -136,13 +136,4 @@ Merges and summarizes multiple per-account LambdaScanner AWS reports into a sing
     python3 MergeLambdaScannerReports.py ./lambdascanner-reports
     python3 MergeLambdaScannerReports.py ./lambdascanner-reports -o ./master-report
 
----
-
-## Contributing
-
-Contributions are welcome! Feel free to submit pull requests with additional scripts or improvements.
-
-## License
-
-MIT License
 
