@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MergeScoutReports.py.py
+MergeScoutReports.py
 
 Merge multiple per-account ScoutSuite AWS reports into one master report.
 
@@ -20,15 +20,19 @@ so it doesn't matter whether ScoutSuite nested its output under an extra
 "scoutsuite-report" directory or wrote directly into the folder you gave it.
 
 Outputs (written to --output, default "<parent_dir>/master-report"):
-  master_report.json   full aggregated data (per-account + cross-account)
-  account_summary.csv  one row per account with totals
-  findings_detail.csv  one row per (account, flagged finding)
-  master_report.html   single-file, filterable/sortable HTML report
+  master_report.json          full aggregated data (per-account + cross-account)
+  account_summary.csv         one row per account with totals
+  findings_detail.csv         one row per (account, flagged finding) - rule-level rollup
+  findings_items_detail.csv   one row per (account, flagged finding, flagged resource) -
+                               filter the "rule" column for a specific finding (e.g.
+                               s3-bucket-allowing-cleartext) and read off every actual
+                               resource it was flagged on (bucket name, ARN, region, etc.)
+  master_report.html          single-file, filterable/sortable HTML report
 
 Usage:
-  python3 MergeScoutReports.py.py ./scoutsuite-reports
-  python3 MergeScoutReports.py.py ./scoutsuite-reports -o ./master-report
-  python3 MergeScoutReports.py.py ./scoutsuite-reports --include-clean
+  python3 MergeScoutReports.py ./scoutsuite-reports
+  python3 MergeScoutReports.py ./scoutsuite-reports -o ./master-report
+  python3 MergeScoutReports.py ./scoutsuite-reports --include-clean
 
 Requires: alive-progress (pip install alive-progress) for the progress bars.
 """
@@ -67,6 +71,59 @@ def load_results(js_path):
     if start == -1:
         raise ValueError(f'no JSON payload found in {js_path}')
     return json.loads(text[start:])
+
+
+def resolve_item_path(services, item_path):
+    """Walk a ScoutSuite finding's dot-notation item path against the raw
+    per-account services tree and pull out the actual AWS resource
+    identifiers along the way.
+
+    ScoutSuite builds each flagged item's path by substituting the real
+    dict key for every literal "id" placeholder in a rule's path template
+    (see ScoutSuite.core.utils.recurse in ScoutSuite's own source). For most
+    resource types that key is already a human-recognizable AWS ID
+    (sg-xxxx, an instance ID, etc.), but for a few - S3 buckets in
+    particular, since bucket names can contain characters that break
+    ScoutSuite's path scheme - it's an internal SHA1 hash instead
+    (scoutid-<hash>), which is useless to a tester on its own.
+
+    Every parsed resource dict ScoutSuite builds carries a 'name' attribute
+    (and usually 'id'/'arn' too - see get_name() in ScoutSuite's source, used
+    across ~50 resource-collection modules), so walking the path against the
+    real tree and reading those attributes off whatever dict we pass through
+    recovers the actual, copy-pasteable resource identity regardless of
+    what the raw path segment looks like.
+    """
+    segments = item_path.split('.')
+    node = services
+    region = ''
+    stops = []
+    prev_seg = None
+    for seg in segments:
+        if isinstance(node, dict) and seg in node:
+            node = node[seg]
+        elif isinstance(node, list):
+            try:
+                node = node[int(seg)]
+            except (ValueError, IndexError):
+                break
+        else:
+            break
+        if prev_seg == 'regions':
+            region = seg
+        if isinstance(node, dict) and any(k in node for k in ('name', 'id', 'arn')):
+            stops.append({'path': seg, 'name': node.get('name'), 'id': node.get('id'), 'arn': node.get('arn')})
+        prev_seg = seg
+
+    primary = stops[-1] if stops else None
+    breadcrumb = ' > '.join((s['name'] or s['id'] or s['path']) for s in stops)
+    return {
+        'region': region,
+        'resource': (primary['name'] or primary['id'] or primary['path']) if primary else '',
+        'resource_id': (primary['id'] or '') if primary else '',
+        'resource_arn': (primary['arn'] or '') if primary else '',
+        'resource_breadcrumb': breadcrumb,
+    }
 
 
 def collect_account(account_dir, include_clean):
@@ -125,6 +182,17 @@ def collect_account(account_dir, include_clean):
                     totals['rules_flagged_warning'] += 1
 
             if flagged > 0 or include_clean:
+                items = finding.get('items', []) or []
+                resolved_items = []
+                for item in items:
+                    try:
+                        resolved = resolve_item_path(services, item)
+                    except Exception:
+                        resolved = {'region': '', 'resource': '', 'resource_id': '',
+                                    'resource_arn': '', 'resource_breadcrumb': ''}
+                    resolved['item_path'] = item
+                    resolved_items.append(resolved)
+
                 findings.append({
                     'service': service_name,
                     'rule': rule_key,
@@ -134,7 +202,8 @@ def collect_account(account_dir, include_clean):
                     'level': level,
                     'checked_items': checked,
                     'flagged_items': flagged,
-                    'items': finding.get('items', []) or [],
+                    'items': items,
+                    'resolved_items': resolved_items,
                 })
 
     for svc_summary in summary.values():
@@ -206,6 +275,29 @@ def write_findings_detail_csv(path, accounts):
                 w.writerow([a['folder'], a['account_id'], finding['service'], finding['rule'],
                             finding['level'], finding['checked_items'], finding['flagged_items'],
                             finding['description']])
+
+
+def write_findings_items_csv(path, accounts):
+    """One row per (account, finding, flagged resource) - the granular CSV:
+    filter the 'rule' column for a specific finding and read off every
+    actual resource (bucket, security group, IAM user, etc.) it hit."""
+    fields = ['account_folder', 'account_id', 'service', 'rule', 'level', 'region',
+              'resource', 'resource_id', 'resource_arn', 'resource_breadcrumb',
+              'item_path', 'description']
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(fields)
+        for a in accounts:
+            for finding in a['findings']:
+                resolved_items = finding.get('resolved_items') or []
+                if not resolved_items:
+                    # rule matched with zero flagged items (only happens with --include-clean)
+                    continue
+                for r in resolved_items:
+                    w.writerow([a['folder'], a['account_id'], finding['service'], finding['rule'],
+                                finding['level'], r['region'], r['resource'], r['resource_id'],
+                                r['resource_arn'], r['resource_breadcrumb'], r['item_path'],
+                                finding['description']])
 
 
 HTML_TEMPLATE = """<!doctype html>
@@ -553,6 +645,9 @@ def main():
     def _write_findings_csv():
         write_findings_detail_csv(os.path.join(output_dir, 'findings_detail.csv'), accounts)
 
+    def _write_findings_items_csv():
+        write_findings_items_csv(os.path.join(output_dir, 'findings_items_detail.csv'), accounts)
+
     def _write_html():
         with open(os.path.join(output_dir, 'master_report.html'), 'w', encoding='utf-8') as f:
             f.write(render_html(accounts, rule_index))
@@ -562,6 +657,7 @@ def main():
         ('writing master_report.json', _write_json),
         ('writing account_summary.csv', _write_account_csv),
         ('writing findings_detail.csv', _write_findings_csv),
+        ('writing findings_items_detail.csv', _write_findings_items_csv),
         ('writing master_report.html', _write_html),
     ]
     with alive_bar(len(report_steps), title='Generating master report') as bar:
@@ -577,6 +673,7 @@ def main():
     print(f"  - {os.path.join(output_dir, 'master_report.json')}")
     print(f"  - {os.path.join(output_dir, 'account_summary.csv')}")
     print(f"  - {os.path.join(output_dir, 'findings_detail.csv')}")
+    print(f"  - {os.path.join(output_dir, 'findings_items_detail.csv')}")
 
 
 if __name__ == '__main__':
