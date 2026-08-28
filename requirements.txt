@@ -2,3 +2,4 @@ boto3>=1.28
 requests>=2.31
 alive-progress>=3.1
 tabulate>=0.9
+rich
