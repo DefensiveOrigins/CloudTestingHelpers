@@ -24,7 +24,9 @@ WHAT IT SCANS
 For every *enabled* region, the script collects, via explicit, dedicated
 API calls (NOT dependent on the tagging API below):
   - EC2 instances
+  - EC2 AMIs (self-owned only)
   - EBS volumes
+  - EC2 snapshots (self-owned only)
   - VPCs
   - RDS instances (incl. multi-AZ members) and RDS/Aurora clusters
   - Lambda functions
@@ -32,12 +34,21 @@ API calls (NOT dependent on the tagging API below):
   - Application/Network/Gateway Load Balancers (ELBv2)
   - CloudFormation stacks (any status except fully-deleted)
   - SNS topics
+  - SQS queues
+  - DynamoDB tables
   - S3 buckets (global service, bucketed into their actual region)
+
+GLOBAL, not per-region -- collected ONCE per account so the same resource
+isn't double/triple/N-times-counted across every enabled region:
+  - IAM users, roles, groups, and access keys (reported in a distinct
+    "global (IAM)" row, excluded from the region-scoping/expected-region
+    math -- IAM isn't a region, so "expected region" findings don't apply
+    to it, but the inventory and any collector errors are still surfaced)
 
 ...plus, as a broad catch-all, everything else the account has that
 supports the Resource Groups Tagging API (`resourcegroupstaggingapi:
-GetResources`) -- DynamoDB, SQS, KMS, ECS/EKS, API Gateway, and most other
-taggable services. IMPORTANT: this catch-all is a SINGLE permission
+GetResources`) -- KMS, ECS/EKS, API Gateway, and most other taggable
+services. IMPORTANT: this catch-all is a SINGLE permission
 (`tag:GetResources`) covering dozens of resource types at once -- if an SCP
 or IAM policy blocks it (common with locked-down read-only roles), every
 resource type that ISN'T explicitly listed above goes uncollected for that
@@ -74,7 +85,9 @@ REQUIRED IAM PERMISSIONS (read-only)
     sts:GetCallerIdentity
     ec2:DescribeRegions
     ec2:DescribeInstances
+    ec2:DescribeImages
     ec2:DescribeVolumes
+    ec2:DescribeSnapshots
     ec2:DescribeVpcs
     rds:DescribeDBInstances
     rds:DescribeDBClusters
@@ -82,8 +95,14 @@ REQUIRED IAM PERMISSIONS (read-only)
     elasticloadbalancing:DescribeLoadBalancers
     cloudformation:ListStacks
     sns:ListTopics
+    sqs:ListQueues
+    dynamodb:ListTables
     s3:ListAllMyBuckets
     s3:GetBucketLocation
+    iam:ListUsers
+    iam:ListRoles
+    iam:ListGroups
+    iam:ListAccessKeys
     tag:GetResources
 
 INSTALL
@@ -232,6 +251,7 @@ class RegionResult:
     expected: Optional[bool] = None  # None = user gave no --expected-regions
     finding: str = ""
     severity: str = "none"  # none|good|ok|info|warn|partial|finding|error
+    is_pseudo_region: bool = False  # True for the global IAM inventory row -- not a real AWS region
 
 
 # --------------------------------------------------------------------------
@@ -459,9 +479,69 @@ def collect_sns_topics(session, region, account_id, partition) -> List[ResourceR
     return out
 
 
+def collect_ec2_amis(session, region, account_id, partition) -> List[ResourceRecord]:
+    """Self-owned AMIs only -- describe_images() with no owner filter would
+    return AWS's entire public/marketplace AMI catalog (hundreds of
+    thousands of images), not this account's resources."""
+    ec2 = session.client("ec2", region_name=region, config=RETRY_CONFIG)
+    images = _paginate(ec2, "describe_images", "Images", Owners=["self"])
+    out = []
+    for img in images:
+        iid = img["ImageId"]
+        out.append(ResourceRecord(
+            resource_type="ec2:image",
+            resource_id=iid,
+            name=img.get("Name", ""),
+            arn=f"arn:{partition}:ec2:{region}:{account_id}:image/{iid}",
+        ))
+    return out
+
+
+def collect_ec2_snapshots(session, region, account_id, partition) -> List[ResourceRecord]:
+    """Self-owned snapshots only -- same reasoning as AMIs above: an
+    unfiltered describe_snapshots() call returns every public snapshot in
+    the region, not this account's."""
+    ec2 = session.client("ec2", region_name=region, config=RETRY_CONFIG)
+    snaps = _paginate(ec2, "describe_snapshots", "Snapshots", OwnerIds=["self"])
+    out = []
+    for s in snaps:
+        sid = s["SnapshotId"]
+        out.append(ResourceRecord(
+            resource_type="ec2:snapshot",
+            resource_id=sid,
+            name=_tag_name(s.get("Tags")) or s.get("Description", ""),
+            arn=f"arn:{partition}:ec2:{region}:{account_id}:snapshot/{sid}",
+        ))
+    return out
+
+
+def collect_dynamodb_tables(session, region, account_id, partition) -> List[ResourceRecord]:
+    ddb = session.client("dynamodb", region_name=region, config=RETRY_CONFIG)
+    names = _paginate(ddb, "list_tables", "TableNames")
+    return [ResourceRecord(
+        resource_type="dynamodb:table", resource_id=name, name="",
+        arn=f"arn:{partition}:dynamodb:{region}:{account_id}:table/{name}",
+    ) for name in names]
+
+
+def collect_sqs_queues(session, region, account_id, partition) -> List[ResourceRecord]:
+    sqs = session.client("sqs", region_name=region, config=RETRY_CONFIG)
+    urls = _paginate(sqs, "list_queues", "QueueUrls")
+    out = []
+    for url in urls:
+        name = url.rstrip("/").split("/")[-1]
+        out.append(ResourceRecord(
+            resource_type="sqs:queue", resource_id=name, name="",
+            arn=f"arn:{partition}:sqs:{region}:{account_id}:{name}",
+        ))
+    return out
+
+
 CORE_COLLECTORS = [
     ("EC2 Instances", collect_ec2_instances),
     ("EBS Volumes", collect_ebs_volumes),
+    ("EC2 AMIs", collect_ec2_amis),
+    ("EC2 Snapshots", collect_ec2_snapshots),
     ("VPCs", collect_vpcs),
     ("RDS Instances", collect_rds_instances),
     ("RDS Clusters", collect_rds_clusters),
@@ -470,6 +550,8 @@ CORE_COLLECTORS = [
     ("ALB/NLB/GWLB", collect_elbv2),
     ("CloudFormation Stacks", collect_cloudformation_stacks),
     ("SNS Topics", collect_sns_topics),
+    ("SQS Queues", collect_sqs_queues),
+    ("DynamoDB Tables", collect_dynamodb_tables),
 ]
 
 
@@ -504,10 +586,65 @@ def collect_s3_buckets_by_region(session, account_id, partition) -> Tuple[Dict[s
     return by_region, errors
 
 
+def collect_iam_users(session, account_id, partition) -> List[ResourceRecord]:
+    iam = session.client("iam", region_name="us-east-1", config=RETRY_CONFIG)
+    users = _paginate(iam, "list_users", "Users")
+    return [ResourceRecord(resource_type="iam:user", resource_id=u["UserName"], name="",
+                            arn=u["Arn"]) for u in users]
+
+
+def collect_iam_roles(session, account_id, partition) -> List[ResourceRecord]:
+    iam = session.client("iam", region_name="us-east-1", config=RETRY_CONFIG)
+    roles = _paginate(iam, "list_roles", "Roles")
+    out = []
+    for r in roles:
+        label = "service-linked" if r.get("Path", "").startswith("/aws-service-role/") else ""
+        out.append(ResourceRecord(resource_type="iam:role", resource_id=r["RoleName"],
+                                   name=label, arn=r["Arn"]))
+    return out
+
+
+def collect_iam_groups(session, account_id, partition) -> List[ResourceRecord]:
+    iam = session.client("iam", region_name="us-east-1", config=RETRY_CONFIG)
+    groups = _paginate(iam, "list_groups", "Groups")
+    return [ResourceRecord(resource_type="iam:group", resource_id=g["GroupName"], name="",
+                            arn=g["Arn"]) for g in groups]
+
+
+def collect_iam_access_keys(session, account_id, partition) -> List[ResourceRecord]:
+    """Independently re-lists users (rather than sharing collect_iam_users's
+    result) so this collector fails/succeeds on its own -- consistent with
+    every other collector never depending on another collector's state."""
+    iam = session.client("iam", region_name="us-east-1", config=RETRY_CONFIG)
+    users = _paginate(iam, "list_users", "Users")
+    out = []
+    for u in users:
+        user_name = u["UserName"]
+        keys = _paginate(iam, "list_access_keys", "AccessKeyMetadata", UserName=user_name)
+        for k in keys:
+            key_id = k["AccessKeyId"]
+            created = k.get("CreateDate")
+            created_str = created.strftime("%Y-%m-%d") if hasattr(created, "strftime") else ""
+            out.append(ResourceRecord(
+                resource_type="iam:access-key", resource_id=key_id,
+                name=f"{k.get('Status', '')}, user={user_name}, created={created_str}",
+                arn=f"arn:{partition}:iam::{account_id}:user/{user_name}/access-key/{key_id}",
+            ))
+    return out
+
+
+IAM_COLLECTORS = [
+    ("IAM Users", collect_iam_users),
+    ("IAM Roles", collect_iam_roles),
+    ("IAM Groups", collect_iam_groups),
+    ("IAM Access Keys", collect_iam_access_keys),
+]
+
+
 def collect_tagged_resources(session, region, account_id, partition) -> List[ResourceRecord]:
     """Catch-all via the Resource Groups Tagging API -- covers most
-    services not explicitly collected above (DynamoDB, SQS, KMS, ECS/EKS,
-    API Gateway, etc.)."""
+    services not explicitly collected above (KMS, ECS/EKS, API Gateway,
+    etc.)."""
     client = session.client("resourcegroupstaggingapi", region_name=region, config=RETRY_CONFIG)
     items = _paginate(client, "get_resources", "ResourceTagMappingList", ResourcesPerPage=100)
     out = []
@@ -545,44 +682,58 @@ def _type_and_id_from_arn(arn: str) -> Tuple[str, str]:
 # Per-region scan orchestration
 # --------------------------------------------------------------------------
 
-def scan_region(session, account_id, partition, region, extra_records=None,
-                 skip_tagging_api=False) -> Tuple[List[ResourceRecord], List[CollectorError], bool, int]:
+def _run_collectors(collectors, error_region_label: str, fn_args: tuple,
+                     extra_records=None) -> Tuple[List[ResourceRecord], List[CollectorError], bool]:
+    """Runs a list of (label, fn) collectors against the same args, merging
+    results de-duplicated by ARN and tracking per-collector failures without
+    letting any single denied/broken collector take down the others. Shared
+    by scan_region() (regional collectors) and IAM collection (global,
+    once per account)."""
     seen_arns: Set[str] = set()
     records: List[ResourceRecord] = []
     errors: List[CollectorError] = []
     any_success = False
-    collector_total = len(CORE_COLLECTORS) + (0 if skip_tagging_api else 1)
 
     def add(rec: ResourceRecord):
         if rec.arn not in seen_arns:
             seen_arns.add(rec.arn)
             records.append(rec)
 
-    for label, fn in CORE_COLLECTORS:
+    for label, fn in collectors:
         try:
-            for rec in fn(session, region, account_id, partition):
+            for rec in fn(*fn_args):
                 add(rec)
             any_success = True
         except (ClientError, BotoCoreError, EndpointConnectionError) as e:
-            errors.append(_classify_error(region, label, e))
+            errors.append(_classify_error(error_region_label, label, e))
         except Exception as e:  # defensive -- never let one collector kill the scan
-            errors.append(_classify_error(region, label, e))
-
-    if not skip_tagging_api:
-        try:
-            for rec in collect_tagged_resources(session, region, account_id, partition):
-                add(rec)
-            any_success = True
-        except (ClientError, BotoCoreError, EndpointConnectionError) as e:
-            errors.append(_classify_error(region, "Resource Groups Tagging API", e))
-        except Exception as e:
-            errors.append(_classify_error(region, "Resource Groups Tagging API", e))
+            errors.append(_classify_error(error_region_label, label, e))
 
     for rec in (extra_records or []):
         add(rec)
         any_success = True
 
+    return records, errors, any_success
+
+
+def scan_region(session, account_id, partition, region, extra_records=None,
+                 skip_tagging_api=False) -> Tuple[List[ResourceRecord], List[CollectorError], bool, int]:
+    collector_total = len(CORE_COLLECTORS) + (0 if skip_tagging_api else 1)
+    collectors = list(CORE_COLLECTORS)
+    if not skip_tagging_api:
+        collectors = collectors + [("Resource Groups Tagging API", collect_tagged_resources)]
+
+    records, errors, any_success = _run_collectors(
+        collectors, region, (session, region, account_id, partition), extra_records=extra_records,
+    )
     return records, errors, any_success, collector_total
+
+
+def collect_iam_resources(session, account_id, partition) -> Tuple[List[ResourceRecord], List[CollectorError], bool]:
+    """IAM is a fully global service -- collected ONCE per account here,
+    never inside the per-region loop, so the same role/user/group ARN
+    doesn't get counted once per enabled region."""
+    return _run_collectors(IAM_COLLECTORS, "global", (session, account_id, partition))
 
 
 def get_account_identity(session, bootstrap_region) -> Tuple[str, str]:
@@ -611,6 +762,24 @@ def get_all_regions(session, bootstrap_region) -> List[Tuple[str, bool]]:
 
 def classify(region_result: RegionResult, expected_regions: Optional[Set[str]]):
     r = region_result
+
+    if r.is_pseudo_region:
+        # IAM is global, not region-scoped -- "expected region" logic simply
+        # doesn't apply to it. Report it as inventory, not a region finding.
+        r.expected = None
+        if r.resource_count is None:
+            r.finding = (f"Global IAM inventory - could not enumerate "
+                         f"({len(r.errors)}/{r.collector_total} collectors denied)")
+            r.severity = "error"
+        else:
+            r.finding = "Global IAM inventory (account-wide, not region-scoped)"
+            r.severity = "info"
+            if r.errors:
+                r.finding += (f" [INCOMPLETE: {len(r.errors)}/{r.collector_total} "
+                               f"collectors denied -- count is a MINIMUM]")
+                r.severity = "partial"
+        return
+
     if not r.enabled:
         r.expected = None
         r.finding = "Disabled (good)"
@@ -673,8 +842,9 @@ def classify(region_result: RegionResult, expected_regions: Optional[Set[str]]):
 
 def compute_account_metrics(region_results: List[RegionResult], expected_regions: Optional[Set[str]]) -> dict:
     m = Counter()
-    m["total_regions_checked"] = len(region_results)
-    for r in region_results:
+    real_regions = [r for r in region_results if not r.is_pseudo_region]
+    m["total_regions_checked"] = len(real_regions)
+    for r in real_regions:
         if not r.enabled:
             m["disabled_regions"] += 1
             continue
@@ -716,6 +886,14 @@ def compute_account_metrics(region_results: List[RegionResult], expected_regions
                 # collectors denied) -- we genuinely don't know if it's
                 # empty. Still a finding: it shouldn't be enabled at all.
                 m["unexpected_regions_unconfirmed"] += 1  # KEY FINDING -- inconclusive
+
+    # IAM is global, not region-scoped -- reported separately from the
+    # region tallies above rather than folded into them.
+    for r in region_results:
+        if r.is_pseudo_region:
+            m["iam_resource_count"] = r.resource_count if r.resource_count is not None else 0
+            m["iam_data_unknown"] = 1 if r.resource_count is None else 0
+            m["iam_collector_errors"] = len(r.errors)
     return m
 
 
@@ -778,7 +956,7 @@ def parse_args():
                          "5_collector_errors_<timestamp>.csv.")
     p.add_argument("--max-workers", type=int, default=8, metavar="N",
                     help="Max region-scans to run concurrently, pooled across every profile "
-                         "being audited (default: 8). Each worker still calls the ~11 collectors "
+                         "being audited (default: 8). Each worker still calls the ~15 collectors "
                          "for its region one at a time, so this bounds total concurrent AWS API "
                          "calls, not multiplies against region/profile counts. Every client also "
                          "retries with adaptive backoff on throttling, so raising this is safe to "
@@ -844,13 +1022,19 @@ def render_region_table(console: Console, profile: str, account_id: str,
 
     for r in region_results:
         style = SEVERITY_STYLE.get(r.severity, "white")
-        region_status = "Enabled" if r.enabled else "Disabled"
-        if expected_regions is None:
+        if r.is_pseudo_region:
+            region_label = r.region
+            region_status = "Global"
             expected_str = "n/a"
-        elif r.expected is None:
-            expected_str = "?"
         else:
-            expected_str = "Yes" if r.expected else "No"
+            region_label = r.region
+            region_status = "Enabled" if r.enabled else "Disabled"
+            if expected_regions is None:
+                expected_str = "n/a"
+            elif r.expected is None:
+                expected_str = "?"
+            else:
+                expected_str = "Yes" if r.expected else "No"
         if r.resource_count is None:
             count_str = "-"
         elif r.errors:
@@ -863,7 +1047,7 @@ def render_region_table(console: Console, profile: str, account_id: str,
             errors_str = f"{len(r.errors)}/{r.collector_total} denied"
         else:
             errors_str = "-"
-        table.add_row(r.region, region_status, expected_str, count_str, errors_str,
+        table.add_row(region_label, region_status, expected_str, count_str, errors_str,
                        r.finding, style=style)
 
     console.print(table)
@@ -878,6 +1062,15 @@ def render_findings_panel(console: Console, profile: str, account_id: str, m: di
         f"  - Enabled Regions With Resources: {m.get('enabled_regions_with_resources', 0)}",
         f"  - Enabled Regions, No Resources:  {m.get('enabled_regions_without_resources', 0)}",
         f"Regions That Errored (fully unknown): {m.get('regions_with_errors', 0)}",
+    ]
+    iam_count = m.get("iam_resource_count", 0)
+    iam_errs = m.get("iam_collector_errors", 0)
+    iam_unknown_prefix = "unknown -- " if m.get("iam_data_unknown", 0) else ""
+    iam_error_suffix = f" ({iam_errs} collector error(s))" if iam_errs else ""
+    lines += [
+        "",
+        f"IAM Inventory (global, not region-scoped): {iam_unknown_prefix}"
+        f"{iam_count} user(s)/role(s)/group(s)/access key(s) found{iam_error_suffix}",
     ]
     if m.get("regions_with_partial_data", 0) or m.get("total_collector_errors", 0):
         lines.append(
@@ -1033,8 +1226,15 @@ def main():
                                f"'{profile}'.[/yellow]")
                 continue
 
-        # S3 is global -- resolve buckets to their real region once, up front.
+        # S3 and IAM are both global -- resolve/collect them once, up front,
+        # rather than inside the per-region loop (which would count every
+        # IAM role/user once per enabled region).
         s3_by_region, s3_errors = collect_s3_buckets_by_region(session, account_id, partition)
+        iam_records, iam_errors, iam_any_success = collect_iam_resources(session, account_id, partition)
+        iam_result = RegionResult(region="global (IAM)", enabled=True, resources=iam_records,
+                                   errors=iam_errors, collector_total=len(IAM_COLLECTORS),
+                                   is_pseudo_region=True)
+        iam_result.resource_count = len(iam_records) if iam_any_success else None
 
         region_results_map: Dict[str, RegionResult] = {}
         for region_name, enabled in regions:
@@ -1044,7 +1244,7 @@ def main():
         profile_ctxs.append({
             "profile": profile, "account_id": account_id, "partition": partition,
             "regions": regions, "s3_by_region": s3_by_region, "s3_errors": s3_errors,
-            "region_results_map": region_results_map,
+            "region_results_map": region_results_map, "iam_result": iam_result,
         })
 
     # ---- Phase 2: build one flat job list across EVERY profile's enabled regions ----
@@ -1082,6 +1282,7 @@ def main():
         account_id = ctx["account_id"]
         s3_errors = ctx["s3_errors"]
         region_results = [ctx["region_results_map"][name] for name, _ in ctx["regions"]]
+        region_results.append(ctx["iam_result"])  # global IAM inventory, appended last
 
         console.rule(f"[bold]Profile: {profile}[/bold]")
 
@@ -1127,10 +1328,15 @@ def main():
 
         # ---- accumulate CSV rows ----
         for r in region_results:
-            expected_str = "n/a" if expected_regions is None else (
-                "?" if r.expected is None else ("Yes" if r.expected else "No"))
+            if r.is_pseudo_region:
+                region_status_str = "Global"
+                expected_str = "n/a"
+            else:
+                region_status_str = "Enabled" if r.enabled else "Disabled"
+                expected_str = "n/a" if expected_regions is None else (
+                    "?" if r.expected is None else ("Yes" if r.expected else "No"))
             csv_region_rows.append([
-                profile, account_id, r.region, "Enabled" if r.enabled else "Disabled",
+                profile, account_id, r.region, region_status_str,
                 expected_str, r.resource_count if r.resource_count is not None else "",
                 "Yes" if (r.errors and r.resource_count is not None) else "No",
                 len(r.errors), r.collector_total if r.enabled else "",
