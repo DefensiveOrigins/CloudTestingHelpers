@@ -123,6 +123,8 @@ FIELDNAMES = [
     "tested_file",
     "tested_file_size_bytes",
     "tested_file_source",
+    "tested_file_url_https",
+    "tested_file_url_http",
     "file_public_no_auth_https",
     "file_https_check_raw_result",
     "file_public_http_unencrypted",
@@ -383,10 +385,27 @@ def host_from_redirect_hint(hint, bucket_name):
 
 def resolve_working_host(bucket_name, region_hint, timeout, logger, max_hops=3):
     """Determine the S3 endpoint host that actually serves anonymous
-    path-style requests for this bucket, following S3's redirect-via-body
-    behavior (301 PermanentRedirect / 400 AuthorizationHeaderMalformed)
-    rather than relying on `requests`'s automatic redirect handling, which
-    only works when a Location header is present -- S3 often omits one here.
+    path-style requests for this bucket.
+
+    Two independent signals are used, in priority order, because neither one
+    alone is reliable enough:
+
+      1. The `x-amz-bucket-region` RESPONSE HEADER. AWS sets this on almost
+         every response for a bucket that exists -- a clean 200, a 403
+         (private bucket, still tells you its real region), a 301, or a 400
+         -- and it requires no credentials at all. This is the standard
+         technique tools use to discover a bucket's true region
+         unauthenticated, and it does not depend on the error body having
+         any particular shape.
+      2. Parsing the XML error body for a <Region> (400
+         AuthorizationHeaderMalformed) or <Endpoint> (301 PermanentRedirect)
+         tag. Kept as a fallback for the rare case where the header itself
+         is stripped or absent, since AWS's exact error body content for a
+         301 varies and sometimes omits both of these tags entirely.
+
+    `requests`'s automatic redirect handling isn't relied on here because it
+    only fires when an HTTP Location header is present -- S3 frequently
+    signals "wrong endpoint" via body/header instead, with no Location.
 
     Returns (host_used, response_from_bucket_root_or_None, err_or_None). The
     response is reused as the index-listing check so we don't issue a
@@ -402,17 +421,33 @@ def resolve_working_host(bucket_name, region_hint, timeout, logger, max_hops=3):
         resp, err = anonymous_get(url, timeout, logger)
         if err is not None:
             return host, None, err
-        if resp.status_code in (301, 400):
+
+        next_host = None
+
+        header_region = resp.headers.get("x-amz-bucket-region")
+        if header_region:
+            candidate = resolve_host(header_region)
+            if candidate != host:
+                next_host = candidate
+                logger.debug(
+                    f"  x-amz-bucket-region header on {host} says "
+                    f"'{header_region}' -- retrying via {candidate}"
+                )
+
+        if next_host is None and resp.status_code in (301, 400):
             hint = parse_redirect_hint(resp.text)
             if hint:
-                new_host = host_from_redirect_hint(hint, bucket_name)
-                if new_host and new_host != host:
+                candidate = host_from_redirect_hint(hint, bucket_name)
+                if candidate and candidate != host:
+                    next_host = candidate
                     logger.debug(
                         f"  {resp.status_code} on {host}; body names "
-                        f"{hint[0]}='{hint[1]}' -- retrying via {new_host}"
+                        f"{hint[0]}='{hint[1]}' -- retrying via {candidate}"
                     )
-                    host = new_host
-                    continue
+
+        if next_host:
+            host = next_host
+            continue
         break
     return host, resp, None
 
@@ -479,10 +514,12 @@ def test_index_public(bucket_name, region, timeout, logger):
         return False, None, None, f"{resp.status_code} via {host}", host
     if resp.status_code == 404:
         return False, None, "Index check returned 404 (unexpected for an existing bucket)", f"404 via {host}", host
-    snippet = (resp.text or "")[:200].replace("\n", " ")
+    header_region = resp.headers.get("x-amz-bucket-region", "not present in response")
+    snippet = (resp.text or "")[:500].replace("\n", " ")
     return (None, None,
-            f"Index check returned unexpected HTTP {resp.status_code} via {host}",
-            f"HTTP {resp.status_code} via {host}: {snippet}", host)
+            f"Index check returned unexpected HTTP {resp.status_code} via {host} "
+            f"(x-amz-bucket-region header: {header_region})",
+            f"HTTP {resp.status_code} via {host} (x-amz-bucket-region: {header_region}): {snippet}", host)
 
 
 def test_object_access(bucket_name, key, host, timeout, delay, logger):
@@ -495,10 +532,11 @@ def test_object_access(bucket_name, key, host, timeout, delay, logger):
     """
     notes = []
     encoded_key = quote(key, safe="/")
+    https_url = f"https://{host}/{bucket_name}/{encoded_key}"
+    http_url = f"http://{host}/{bucket_name}/{encoded_key}"
 
     # 1) HTTPS, unauthenticated
     https_public = None
-    https_url = f"https://{host}/{bucket_name}/{encoded_key}"
     resp, err = anonymous_get(https_url, timeout, logger)
     if err is not None:
         notes.append(f"HTTPS object check error: {err}")
@@ -512,21 +550,22 @@ def test_object_access(bucket_name, key, host, timeout, delay, logger):
     elif resp.status_code in (301, 400):
         # The bucket-level redirect should already have resolved `host`
         # correctly; hitting this on a specific object usually means the
-        # object itself needs a further hop (rare). Record it plainly
-        # rather than silently guessing again.
+        # object itself needs a further hop (rare). Record it plainly,
+        # including the region header, rather than silently guessing again.
+        header_region = resp.headers.get("x-amz-bucket-region", "not present in response")
         notes.append(f"HTTPS object check unexpected HTTP {resp.status_code} via {host} "
-                      f"(bucket-level host resolution did not carry over cleanly)")
-        https_raw = f"HTTP {resp.status_code} via {host}: {(resp.text or '')[:200]}"
+                      f"(bucket-level host resolution did not carry over cleanly; "
+                      f"x-amz-bucket-region: {header_region})")
+        https_raw = f"HTTP {resp.status_code} via {host} (x-amz-bucket-region: {header_region}): {(resp.text or '')[:500]}"
     else:
         notes.append(f"HTTPS object check unexpected HTTP {resp.status_code} via {host}")
-        https_raw = f"HTTP {resp.status_code} via {host}: {(resp.text or '')[:200]}"
+        https_raw = f"HTTP {resp.status_code} via {host}: {(resp.text or '')[:500]}"
 
     time.sleep(delay)
 
     # 2) Plain HTTP, unauthenticated -- must actually complete over HTTP,
     #    not be silently upgraded to HTTPS by a redirect. Same resolved host.
     http_unencrypted = None
-    http_url = f"http://{host}/{bucket_name}/{encoded_key}"
     resp2, err2 = anonymous_get(http_url, timeout, logger)
     if err2 is not None:
         notes.append(f"HTTP object check error: {err2}")
@@ -545,9 +584,9 @@ def test_object_access(bucket_name, key, host, timeout, delay, logger):
             http_raw = f"{resp2.status_code} via {host}"
         else:
             notes.append(f"HTTP object check unexpected HTTP {resp2.status_code} via {host}")
-            http_raw = f"HTTP {resp2.status_code} via {host}: {(resp2.text or '')[:200]}"
+            http_raw = f"HTTP {resp2.status_code} via {host}: {(resp2.text or '')[:500]}"
 
-    return https_public, http_unencrypted, notes, https_raw, http_raw
+    return https_public, http_unencrypted, notes, https_raw, http_raw, https_url, http_url
 
 
 # --------------------------------------------------------------------------
@@ -634,9 +673,11 @@ def assess_bucket(s3_client, account_id, profile, bucket_name, args, logger):
         notes.append(f"Tested object: {candidate_key} ({candidate_size} bytes) via {source}")
         logger.info(f"    Selected test object: {candidate_key} ({candidate_size} bytes)")
 
-        https_public, http_unencrypted, obj_notes, https_raw, http_raw = test_object_access(
+        https_public, http_unencrypted, obj_notes, https_raw, http_raw, https_url, http_url = test_object_access(
             bucket_name, candidate_key, resolved_host, args.timeout, args.delay, logger
         )
+        row["tested_file_url_https"] = https_url
+        row["tested_file_url_http"] = http_url
         row["file_public_no_auth_https"] = https_public
         row["file_https_check_raw_result"] = https_raw
         row["file_public_http_unencrypted"] = http_unencrypted
@@ -647,6 +688,8 @@ def assess_bucket(s3_client, account_id, profile, bucket_name, args, logger):
     else:
         row["tested_file"] = "N/A"
         row["tested_file_size_bytes"] = "N/A"
+        row["tested_file_url_https"] = "N/A"
+        row["tested_file_url_http"] = "N/A"
         row["file_public_no_auth_https"] = None
         row["file_public_http_unencrypted"] = None
         notes.append(
