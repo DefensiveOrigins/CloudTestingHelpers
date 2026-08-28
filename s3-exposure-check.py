@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-se-exposure-check.py
+s3_public_exposure_check.py
 ============================
 
 Purpose
@@ -53,10 +53,10 @@ Requirements
 
 Usage
 -----
-    python3 se-exposure-check.py --profile prod
-    python3 se-exposure-check.py --profile prod dev qa
-    python3 se-exposure-check.py --all-profiles
-    python3 se-exposure-check.py --all-profiles --output-dir ./results -v
+    python3 s3_public_exposure_check.py --profile prod
+    python3 s3_public_exposure_check.py --profile prod dev qa
+    python3 s3_public_exposure_check.py --all-profiles
+    python3 s3_public_exposure_check.py --all-profiles --output-dir ./results -v
 
 Outputs
 -------
@@ -119,11 +119,14 @@ FIELDNAMES = [
     "acl_public_grant",
     "encryption_status",
     "index_publicly_listable_anonymous",
+    "index_check_raw_result",
     "tested_file",
     "tested_file_size_bytes",
     "tested_file_source",
     "file_public_no_auth_https",
+    "file_https_check_raw_result",
     "file_public_http_unencrypted",
+    "file_http_check_raw_result",
     "risk_level",
     "notes",
 ]
@@ -329,6 +332,91 @@ def anonymous_get(url, timeout, logger):
         return None, str(e)
 
 
+def resolve_host(region):
+    """Build the S3 endpoint host to use. Prefer the region-specific
+    endpoint when we know the region -- the legacy global 's3.amazonaws.com'
+    endpoint does not reliably auto-redirect for buckets in newer "opt-in"
+    regions (e.g. ap-east-1, me-south-1, af-south-1, eu-south-1), which
+    otherwise shows up as an unexplained 400 on every check for that bucket."""
+    if region and region not in ("Unknown", "AccessDenied", "us-east-1", ""):
+        return f"s3.{region}.amazonaws.com"
+    return "s3.amazonaws.com"
+
+
+def parse_redirect_hint(text):
+    """S3 signals 'wrong endpoint' two different ways, depending on why:
+      - HTTP 400 AuthorizationHeaderMalformed: XML body has a <Region> tag.
+      - HTTP 301 PermanentRedirect: XML body has an <Endpoint> tag instead
+        (this is the common case for any bucket outside us-east-1 hit via
+        the flat s3.amazonaws.com endpoint) -- and critically, this 301
+        response does NOT include an HTTP Location header, so `requests`
+        has nothing to auto-follow and just returns the bare 301.
+    Returns ("region", value) or ("endpoint", value) or None."""
+    if not text:
+        return None
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return None
+    region_el = root.find("Region")
+    if region_el is not None and region_el.text:
+        return ("region", region_el.text)
+    endpoint_el = root.find("Endpoint")
+    if endpoint_el is not None and endpoint_el.text:
+        return ("endpoint", endpoint_el.text)
+    return None
+
+
+def host_from_redirect_hint(hint, bucket_name):
+    kind, value = hint
+    if kind == "region":
+        return resolve_host(value)
+    # kind == "endpoint": value may be virtual-hosted style
+    # ("bucket.s3.eu-west-1.amazonaws.com"); strip the bucket prefix so we
+    # keep using path-style requests consistently.
+    host = value
+    prefix = f"{bucket_name}."
+    if host.startswith(prefix):
+        host = host[len(prefix):]
+    return host
+
+
+def resolve_working_host(bucket_name, region_hint, timeout, logger, max_hops=3):
+    """Determine the S3 endpoint host that actually serves anonymous
+    path-style requests for this bucket, following S3's redirect-via-body
+    behavior (301 PermanentRedirect / 400 AuthorizationHeaderMalformed)
+    rather than relying on `requests`'s automatic redirect handling, which
+    only works when a Location header is present -- S3 often omits one here.
+
+    Returns (host_used, response_from_bucket_root_or_None, err_or_None). The
+    response is reused as the index-listing check so we don't issue a
+    duplicate request."""
+    host = resolve_host(region_hint)
+    tried = set()
+    resp = None
+    for _ in range(max_hops):
+        if host in tried:
+            break
+        tried.add(host)
+        url = f"https://{host}/{bucket_name}/"
+        resp, err = anonymous_get(url, timeout, logger)
+        if err is not None:
+            return host, None, err
+        if resp.status_code in (301, 400):
+            hint = parse_redirect_hint(resp.text)
+            if hint:
+                new_host = host_from_redirect_hint(hint, bucket_name)
+                if new_host and new_host != host:
+                    logger.debug(
+                        f"  {resp.status_code} on {host}; body names "
+                        f"{hint[0]}='{hint[1]}' -- retrying via {new_host}"
+                    )
+                    host = new_host
+                    continue
+        break
+    return host, resp, None
+
+
 def parse_listing_for_objects(xml_text):
     """Parse an S3 ListBucketResult XML body into (key, size) tuples,
     skipping zero-byte "folder marker" keys where possible."""
@@ -355,76 +443,111 @@ def parse_listing_for_objects(xml_text):
 
 def choose_small_random_object(candidates):
     """From a list of (key, size) tuples, pick a random object biased toward
-    small size (so downloads stay cheap/fast)."""
+    small size (so downloads stay cheap/fast), preferring a non-empty object.
+
+    A zero-byte object still fully exercises the HTTP status-code logic (S3
+    returns the same status codes regardless of body size), so it's not
+    "wrong" to pick one -- but a real file is a more convincing/reportable
+    proof of exposure, so we search the *entire* candidate list for a
+    non-zero object before ever falling back to a zero-byte one, rather than
+    only looking within the 10 smallest objects."""
     if not candidates:
         return None, None
-    ordered = sorted(candidates, key=lambda kv: kv[1])
+    nonzero_all = [c for c in candidates if c[1] > 0]
+    if nonzero_all:
+        ordered = sorted(nonzero_all, key=lambda kv: kv[1])
+    else:
+        ordered = sorted(candidates, key=lambda kv: kv[1])
     pool = ordered[: min(10, len(ordered))]
-    nonzero = [c for c in pool if c[1] > 0]
-    choice_pool = nonzero if nonzero else pool
-    return random.choice(choice_pool)
+    return random.choice(pool)
 
 
-def test_index_public(bucket_name, timeout, logger):
-    """Anonymous GET on the bucket root (path-style). Determines whether the
-    bucket's object index is viewable by anyone with no credentials."""
-    url = f"https://s3.amazonaws.com/{bucket_name}/"
-    resp, err = anonymous_get(url, timeout, logger)
+def test_index_public(bucket_name, region, timeout, logger):
+    """Resolve the working endpoint for this bucket and evaluate whether its
+    object index is viewable by anyone with no credentials. Returns
+    (is_public, listing_xml_or_None, note_or_None, raw_result, resolved_host)
+    -- the resolved host is passed on to test_object_access so the file
+    checks don't have to re-discover it (or re-trigger the same 301)."""
+    host, resp, err = resolve_working_host(bucket_name, region, timeout, logger)
     if err is not None:
-        return None, None, f"Anonymous index check error: {err}"
+        return None, None, f"Anonymous index check error: {err}", err, host
+    if resp is None:
+        return None, None, f"Index check produced no response via {host}", f"no response via {host}", host
     if resp.status_code == 200 and "<ListBucketResult" in resp.text:
-        return True, resp.text, None
+        return True, resp.text, None, f"200 via {host}", host
     if resp.status_code in (403, 401):
-        return False, None, None
+        return False, None, None, f"{resp.status_code} via {host}", host
     if resp.status_code == 404:
-        return False, None, "Index check returned 404 (unexpected for an existing bucket)"
-    return None, None, f"Index check returned unexpected HTTP {resp.status_code}"
+        return False, None, "Index check returned 404 (unexpected for an existing bucket)", f"404 via {host}", host
+    snippet = (resp.text or "")[:200].replace("\n", " ")
+    return (None, None,
+            f"Index check returned unexpected HTTP {resp.status_code} via {host}",
+            f"HTTP {resp.status_code} via {host}: {snippet}", host)
 
 
-def test_object_access(bucket_name, key, timeout, delay, logger):
-    """Two independent anonymous tests on one specific object:
+def test_object_access(bucket_name, key, host, timeout, delay, logger):
+    """Two independent anonymous tests on one specific object, both issued
+    against the already-resolved working `host` for this bucket (see
+    resolve_working_host / test_index_public):
        1) HTTPS, no credentials  -> is the object publicly downloadable at all
        2) plain HTTP, no credentials -> is it retrievable over an unencrypted
           channel (rather than being redirected/forced to HTTPS)
     """
     notes = []
     encoded_key = quote(key, safe="/")
-    https_url = f"https://s3.amazonaws.com/{bucket_name}/{encoded_key}"
-    http_url = f"http://s3.amazonaws.com/{bucket_name}/{encoded_key}"
 
     # 1) HTTPS, unauthenticated
     https_public = None
+    https_url = f"https://{host}/{bucket_name}/{encoded_key}"
     resp, err = anonymous_get(https_url, timeout, logger)
     if err is not None:
         notes.append(f"HTTPS object check error: {err}")
+        https_raw = err
     elif resp.status_code == 200:
         https_public = True
+        https_raw = f"200 via {host}"
     elif resp.status_code in (401, 403):
         https_public = False
+        https_raw = f"{resp.status_code} via {host}"
+    elif resp.status_code in (301, 400):
+        # The bucket-level redirect should already have resolved `host`
+        # correctly; hitting this on a specific object usually means the
+        # object itself needs a further hop (rare). Record it plainly
+        # rather than silently guessing again.
+        notes.append(f"HTTPS object check unexpected HTTP {resp.status_code} via {host} "
+                      f"(bucket-level host resolution did not carry over cleanly)")
+        https_raw = f"HTTP {resp.status_code} via {host}: {(resp.text or '')[:200]}"
     else:
-        notes.append(f"HTTPS object check unexpected HTTP {resp.status_code}")
+        notes.append(f"HTTPS object check unexpected HTTP {resp.status_code} via {host}")
+        https_raw = f"HTTP {resp.status_code} via {host}: {(resp.text or '')[:200]}"
 
     time.sleep(delay)
 
     # 2) Plain HTTP, unauthenticated -- must actually complete over HTTP,
-    #    not be silently upgraded to HTTPS by a redirect.
+    #    not be silently upgraded to HTTPS by a redirect. Same resolved host.
     http_unencrypted = None
+    http_url = f"http://{host}/{bucket_name}/{encoded_key}"
     resp2, err2 = anonymous_get(http_url, timeout, logger)
     if err2 is not None:
         notes.append(f"HTTP object check error: {err2}")
+        http_raw = err2
     else:
         final_scheme = urlparse(resp2.url).scheme
         if resp2.status_code == 200 and final_scheme == "http":
             http_unencrypted = True
+            http_raw = f"200 via {host} (stayed HTTP)"
         elif resp2.status_code == 200 and final_scheme == "https":
             http_unencrypted = False
             notes.append("Plain-HTTP request was redirected to HTTPS -- object not retrievable over an unencrypted channel")
+            http_raw = f"200 via {host} (redirected to HTTPS)"
         elif resp2.status_code in (401, 403):
             http_unencrypted = False
+            http_raw = f"{resp2.status_code} via {host}"
         else:
-            notes.append(f"HTTP object check unexpected HTTP {resp2.status_code}")
+            notes.append(f"HTTP object check unexpected HTTP {resp2.status_code} via {host}")
+            http_raw = f"HTTP {resp2.status_code} via {host}: {(resp2.text or '')[:200]}"
 
-    return https_public, http_unencrypted, notes
+    return https_public, http_unencrypted, notes, https_raw, http_raw
 
 
 # --------------------------------------------------------------------------
@@ -480,11 +603,14 @@ def assess_bucket(s3_client, account_id, profile, bucket_name, args, logger):
     can_list_api, api_objects = list_objects_via_api(s3_client, bucket_name, args.max_keys, logger)
     row["role_can_list_objects_api"] = str(can_list_api)
 
-    index_public, anon_listing_xml, idx_note = test_index_public(bucket_name, args.timeout, logger)
+    index_public, anon_listing_xml, idx_note, idx_raw, resolved_host = test_index_public(
+        bucket_name, region, args.timeout, logger
+    )
     row["index_publicly_listable_anonymous"] = index_public
+    row["index_check_raw_result"] = idx_raw
     if idx_note:
         notes.append(idx_note)
-    logger.debug(f"  Anonymous index public: {index_public}")
+    logger.debug(f"  Anonymous index public: {index_public} ({idx_raw}); resolved host: {resolved_host}")
 
     time.sleep(args.delay)
 
@@ -508,14 +634,16 @@ def assess_bucket(s3_client, account_id, profile, bucket_name, args, logger):
         notes.append(f"Tested object: {candidate_key} ({candidate_size} bytes) via {source}")
         logger.info(f"    Selected test object: {candidate_key} ({candidate_size} bytes)")
 
-        https_public, http_unencrypted, obj_notes = test_object_access(
-            bucket_name, candidate_key, args.timeout, args.delay, logger
+        https_public, http_unencrypted, obj_notes, https_raw, http_raw = test_object_access(
+            bucket_name, candidate_key, resolved_host, args.timeout, args.delay, logger
         )
         row["file_public_no_auth_https"] = https_public
+        row["file_https_check_raw_result"] = https_raw
         row["file_public_http_unencrypted"] = http_unencrypted
+        row["file_http_check_raw_result"] = http_raw
         notes.extend(obj_notes)
-        logger.debug(f"  File public (HTTPS, no auth): {https_public}; "
-                     f"File public (HTTP, unencrypted): {http_unencrypted}")
+        logger.debug(f"  File public (HTTPS, no auth): {https_public} ({https_raw}); "
+                     f"File public (HTTP, unencrypted): {http_unencrypted} ({http_raw})")
     else:
         row["tested_file"] = "N/A"
         row["tested_file_size_bytes"] = "N/A"
