@@ -21,7 +21,8 @@ This is built for cloud engagement scoping / cleanup work: a customer says
 
 WHAT IT SCANS
 -------------
-For every *enabled* region, the script collects:
+For every *enabled* region, the script collects, via explicit, dedicated
+API calls (NOT dependent on the tagging API below):
   - EC2 instances
   - EBS volumes
   - VPCs
@@ -29,11 +30,20 @@ For every *enabled* region, the script collects:
   - Lambda functions
   - Classic Elastic Load Balancers (ELB)
   - Application/Network/Gateway Load Balancers (ELBv2)
+  - CloudFormation stacks (any status except fully-deleted)
+  - SNS topics
   - S3 buckets (global service, bucketed into their actual region)
-  - Everything else the account has tagged or that supports the Resource
-    Groups Tagging API (`resourcegroupstaggingapi:GetResources`), which
-    covers most other services (DynamoDB, SNS, SQS, CloudFormation, KMS,
-    ECS/EKS, API Gateway, etc.) as a broad catch-all.
+
+...plus, as a broad catch-all, everything else the account has that
+supports the Resource Groups Tagging API (`resourcegroupstaggingapi:
+GetResources`) -- DynamoDB, SQS, KMS, ECS/EKS, API Gateway, and most other
+taggable services. IMPORTANT: this catch-all is a SINGLE permission
+(`tag:GetResources`) covering dozens of resource types at once -- if an SCP
+or IAM policy blocks it (common with locked-down read-only roles), every
+resource type that ISN'T explicitly listed above goes uncollected for that
+region, silently, unless you notice the collector-error count. The
+explicit collectors above exist specifically so the most commonly-relevant
+resource types don't depend on that one permission working.
 
 Results are de-duplicated by ARN, so a resource found by both an explicit
 collector and the tagging-API catch-all is only counted once.
@@ -70,6 +80,8 @@ REQUIRED IAM PERMISSIONS (read-only)
     rds:DescribeDBClusters
     lambda:ListFunctions
     elasticloadbalancing:DescribeLoadBalancers
+    cloudformation:ListStacks
+    sns:ListTopics
     s3:ListAllMyBuckets
     s3:GetBucketLocation
     tag:GetResources
@@ -398,6 +410,55 @@ def collect_elbv2(session, region, account_id, partition) -> List[ResourceRecord
     return out
 
 
+# Every status except DELETE_COMPLETE -- a fully-deleted stack isn't a
+# resource anymore (AWS just keeps the record around briefly for history).
+ACTIVE_STACK_STATUSES = [
+    "CREATE_IN_PROGRESS", "CREATE_FAILED", "CREATE_COMPLETE",
+    "ROLLBACK_IN_PROGRESS", "ROLLBACK_FAILED", "ROLLBACK_COMPLETE",
+    "DELETE_IN_PROGRESS", "DELETE_FAILED",
+    "UPDATE_IN_PROGRESS", "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS", "UPDATE_COMPLETE",
+    "UPDATE_FAILED", "UPDATE_ROLLBACK_IN_PROGRESS", "UPDATE_ROLLBACK_FAILED",
+    "UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS", "UPDATE_ROLLBACK_COMPLETE",
+    "REVIEW_IN_PROGRESS", "IMPORT_IN_PROGRESS", "IMPORT_COMPLETE",
+    "IMPORT_ROLLBACK_IN_PROGRESS", "IMPORT_ROLLBACK_FAILED", "IMPORT_ROLLBACK_COMPLETE",
+]
+
+
+def collect_cloudformation_stacks(session, region, account_id, partition) -> List[ResourceRecord]:
+    cfn = session.client("cloudformation", region_name=region, config=RETRY_CONFIG)
+    stacks = _paginate(cfn, "list_stacks", "StackSummaries",
+                        StackStatusFilter=ACTIVE_STACK_STATUSES)
+    out = []
+    for s in stacks:
+        name = s["StackName"]
+        arn = s.get("StackId") or f"arn:{partition}:cloudformation:{region}:{account_id}:stack/{name}"
+        label = s.get("StackStatus", "")
+        if s.get("ParentId"):
+            label = (label + " [nested]").strip()
+        out.append(ResourceRecord(
+            resource_type="cloudformation:stack",
+            resource_id=name,
+            name=label,
+            arn=arn,
+        ))
+    return out
+
+
+def collect_sns_topics(session, region, account_id, partition) -> List[ResourceRecord]:
+    sns = session.client("sns", region_name=region, config=RETRY_CONFIG)
+    topics = _paginate(sns, "list_topics", "Topics")
+    out = []
+    for t in topics:
+        arn = t["TopicArn"]
+        out.append(ResourceRecord(
+            resource_type="sns:topic",
+            resource_id=arn.split(":")[-1],
+            name="",
+            arn=arn,
+        ))
+    return out
+
+
 CORE_COLLECTORS = [
     ("EC2 Instances", collect_ec2_instances),
     ("EBS Volumes", collect_ebs_volumes),
@@ -407,6 +468,8 @@ CORE_COLLECTORS = [
     ("Lambda Functions", collect_lambda_functions),
     ("Classic Load Balancers", collect_elb_classic),
     ("ALB/NLB/GWLB", collect_elbv2),
+    ("CloudFormation Stacks", collect_cloudformation_stacks),
+    ("SNS Topics", collect_sns_topics),
 ]
 
 
@@ -443,8 +506,8 @@ def collect_s3_buckets_by_region(session, account_id, partition) -> Tuple[Dict[s
 
 def collect_tagged_resources(session, region, account_id, partition) -> List[ResourceRecord]:
     """Catch-all via the Resource Groups Tagging API -- covers most
-    services not explicitly collected above (DynamoDB, SNS, SQS,
-    CloudFormation, KMS, ECS/EKS, API Gateway, etc.)."""
+    services not explicitly collected above (DynamoDB, SQS, KMS, ECS/EKS,
+    API Gateway, etc.)."""
     client = session.client("resourcegroupstaggingapi", region_name=region, config=RETRY_CONFIG)
     items = _paginate(client, "get_resources", "ResourceTagMappingList", ResourcesPerPage=100)
     out = []
@@ -715,7 +778,7 @@ def parse_args():
                          "5_collector_errors_<timestamp>.csv.")
     p.add_argument("--max-workers", type=int, default=8, metavar="N",
                     help="Max region-scans to run concurrently, pooled across every profile "
-                         "being audited (default: 8). Each worker still calls the ~9 collectors "
+                         "being audited (default: 8). Each worker still calls the ~11 collectors "
                          "for its region one at a time, so this bounds total concurrent AWS API "
                          "calls, not multiplies against region/profile counts. Every client also "
                          "retries with adaptive backoff on throttling, so raising this is safe to "
