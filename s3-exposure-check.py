@@ -57,21 +57,29 @@ Usage
     python3 s3_public_exposure_check.py --profile prod dev qa
     python3 s3_public_exposure_check.py --all-profiles
     python3 s3_public_exposure_check.py --all-profiles --output-dir ./results -v
+    python3 s3_public_exposure_check.py --profile prod --threads 10
+
+Buckets within a profile are assessed concurrently (default 5 worker
+threads; see --threads). Profiles themselves are still processed one at a
+time. Progress, the CSV writer, and the summary list are all thread-safe.
 
 Outputs
 -------
-    <output-dir>/s3_assessment_<timestamp>.csv   -- machine-readable results
-    <output-dir>/s3_assessment_<timestamp>.log   -- detailed run log
-    STDOUT                                       -- brief progress + summary table
+    <output-dir>/s3_assessment_<timestamp>.csv           -- per-bucket results
+    <output-dir>/s3_assessment_summary_<timestamp>.csv   -- per-AWS-account rollup
+    <output-dir>/s3_assessment_<timestamp>.log           -- detailed run log
+    STDOUT                                               -- brief progress + both summary tables
 """
 
 import argparse
+import concurrent.futures
 import configparser
 import csv
 import logging
 import random
 import signal
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -139,6 +147,14 @@ SUMMARY_ROWS = []
 # Global handles so a Ctrl+C can flush/close cleanly
 _csv_file_handle = None
 _logger = None
+
+# Bucket assessments run concurrently (default 5 workers, see --threads).
+# These guard the shared CSV writer, the shared SUMMARY_ROWS list, and the
+# progress bar, all of which are otherwise touched from multiple worker
+# threads at once.
+_csv_lock = threading.Lock()
+_summary_lock = threading.Lock()
+_bar_lock = threading.Lock()
 
 
 # --------------------------------------------------------------------------
@@ -705,9 +721,12 @@ def assess_bucket(s3_client, account_id, profile, bucket_name, args, logger):
 
 
 def write_row(csv_writer, row):
-    csv_writer.writerow(row)
-    if _csv_file_handle:
-        _csv_file_handle.flush()
+    """Thread-safe: multiple worker threads assess buckets concurrently and
+    each calls this when their result is ready."""
+    with _csv_lock:
+        csv_writer.writerow(row)
+        if _csv_file_handle:
+            _csv_file_handle.flush()
 
 
 def process_profile(profile, args, csv_writer, logger):
@@ -722,7 +741,10 @@ def process_profile(profile, args, csv_writer, logger):
         return
 
     region_hint = session.region_name or "us-east-1"
-    boto_cfg = BotoConfig(retries={"max_attempts": 3, "mode": "standard"})
+    # max_pool_connections needs enough headroom for the worker pool, or
+    # boto3 will log "Connection pool is full" warnings under concurrency.
+    boto_cfg = BotoConfig(retries={"max_attempts": 3, "mode": "standard"},
+                           max_pool_connections=max(10, args.threads * 2))
 
     try:
         sts_client = session.client("sts", region_name=region_hint, config=boto_cfg)
@@ -745,32 +767,48 @@ def process_profile(profile, args, csv_writer, logger):
         return
 
     logger.info(f"[{profile}] {len(buckets)} bucket(s) found in account {account_id}")
+    logger.info(f"[{profile}] Assessing with {args.threads} concurrent worker thread(s)")
 
     if not buckets:
         return
 
     with alive_bar(len(buckets), title=f"{profile}", enrich_print=False) as bar:
-        for bucket in buckets:
-            bucket_name = bucket["Name"]
-            try:
-                row = assess_bucket(s3_client, account_id, profile, bucket_name, args, logger)
-            except Exception as e:
-                logger.exception(f"[{profile}] Unhandled error assessing bucket {bucket_name}: {e}")
-                row = {fn: "" for fn in FIELDNAMES}
-                row.update({
-                    "timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "aws_account_id": account_id,
-                    "profile": profile,
-                    "bucket_name": bucket_name,
-                    "risk_level": "ERROR",
-                    "notes": f"Unhandled exception during assessment: {e}",
-                })
-            write_row(csv_writer, row)
-            SUMMARY_ROWS.append(row)
-            bar()
-            time.sleep(args.delay)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads,
+                                                     thread_name_prefix=f"s3check-{profile}") as executor:
+            futures = {
+                executor.submit(_assess_bucket_worker, s3_client, account_id, profile,
+                                 bucket["Name"], args, logger): bucket["Name"]
+                for bucket in buckets
+            }
+            for future in concurrent.futures.as_completed(futures):
+                row = future.result()  # _assess_bucket_worker never raises -- it catches internally
+                write_row(csv_writer, row)
+                with _summary_lock:
+                    SUMMARY_ROWS.append(row)
+                with _bar_lock:
+                    bar()
 
     logger.info(f"=== Finished profile: {profile} ===")
+
+
+def _assess_bucket_worker(s3_client, account_id, profile, bucket_name, args, logger):
+    """Runs on a worker thread. Never raises -- any unhandled exception is
+    captured into an ERROR row so one bad bucket can't take down the pool or
+    silently drop a row from the CSV."""
+    try:
+        return assess_bucket(s3_client, account_id, profile, bucket_name, args, logger)
+    except Exception as e:
+        logger.exception(f"[{profile}] Unhandled error assessing bucket {bucket_name}: {e}")
+        row = {fn: "" for fn in FIELDNAMES}
+        row.update({
+            "timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "aws_account_id": account_id,
+            "profile": profile,
+            "bucket_name": bucket_name,
+            "risk_level": "ERROR",
+            "notes": f"Unhandled exception during assessment: {e}",
+        })
+        return row
 
 
 # --------------------------------------------------------------------------
@@ -952,10 +990,20 @@ def parse_args():
         help="Max objects to request per authenticated ListObjectsV2 call (default: 1000)."
     )
     parser.add_argument(
+        "--threads", type=int, default=5,
+        help="Number of buckets to assess concurrently, per profile (default: 5). "
+             "Note --delay is paced per worker thread, so overall request volume "
+             "against a bucket's endpoint scales roughly with this value -- lower "
+             "it (or raise --delay) if you need to stay gentler on a target."
+    )
+    parser.add_argument(
         "-v", "--verbose", action="store_true",
         help="Print debug-level detail to STDOUT as well as the log file."
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.threads < 1:
+        parser.error("--threads must be at least 1")
+    return args
 
 
 def main():
