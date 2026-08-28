@@ -42,6 +42,23 @@ Disabled (opt-in-not-enabled) regions are NOT scanned -- calling a service
 API in a disabled region simply fails, and a disabled region can't hold
 running resources. A disabled region is treated as a *good* outcome.
 
+HANDLING RESTRICTIVE READ-ONLY ROLES
+-------------------------------------
+Engagement credentials are often a minimal read-only role (e.g. AWS SSO's
+AWSReadOnlyAccess) further locked down by a Service Control Policy, so one
+or more collectors may get AccessDenied/UnauthorizedOperation in some or
+all regions. The script never lets a denied collector fail the whole scan:
+  - If SOME collectors in a region succeed, the resource count is reported
+    as a MINIMUM (">=N") and the region's Finding is tagged "[INCOMPLETE:
+    x/y collectors denied]" -- it will not be silently under-reported.
+  - If EVERY collector in a region is denied, the count is shown as unknown
+    ("-"), not zero, and the Finding reads "ERROR - could not enumerate".
+  - By default the raw exceptions (which repeat the caller ARN and SCP ARN
+    on every line) are NOT printed to STDOUT -- only quantified counts
+    appear in the region summary table/panel and in
+    5_collector_errors_<timestamp>.csv. Pass --verbose to print every raw
+    error as it happens.
+
 REQUIRED IAM PERMISSIONS (read-only)
 -------------------------------------
     sts:GetCallerIdentity
@@ -61,6 +78,20 @@ INSTALL
 -------
     pip install boto3 alive-progress rich
 
+CONCURRENCY
+-----------
+Region scans are parallelized across a single shared thread pool covering
+EVERY profile being audited at once (default: 8 concurrent region-scans,
+tune with --max-workers). This bounds total concurrent AWS API calls at a
+flat number regardless of how many accounts/regions are in play, rather
+than multiplying a per-account pool by a per-region pool. Every AWS client
+is additionally configured with adaptive retries (auto backoff on
+Throttling/RequestLimitExceeded), so occasional throttling under
+concurrency is absorbed by the SDK rather than showing up as a permissions
+error. Account/region discovery (STS + DescribeRegions + S3 listing) stays
+sequential per profile -- it's a handful of calls, not the bottleneck.
+Pass --max-workers 1 for the old fully-sequential behavior.
+
 USAGE
 -----
     # Single profile, no expectations set (just inventories everything)
@@ -70,9 +101,13 @@ USAGE
     python3 aws_resource_auditor.py --profile customer-prod \\
         --expected-regions us-east-1,us-west-2
 
-    # Every profile in ~/.aws/credentials
+    # Every profile in ~/.aws/credentials -- scanned concurrently
     python3 aws_resource_auditor.py --all-profiles \\
         --expected-regions us-east-1 us-west-2 eu-west-1
+
+    # Turn concurrency up (faster, more AWS API pressure) or down/off
+    python3 aws_resource_auditor.py --all-profiles --max-workers 16
+    python3 aws_resource_auditor.py --all-profiles --max-workers 1
 
     # Custom credentials file / output location
     python3 aws_resource_auditor.py --all-profiles \\
@@ -83,15 +118,19 @@ OUTPUT
 ------
 Printed to STDOUT (per account):
   - Region summary table (resource count per region, unexpected regions
-    highlighted)
+    highlighted, collector-error counts called out)
   - Findings panel (the "Number of ..." rollup metrics)
+  - Collector-error details ONLY with --verbose (otherwise a single
+    quantified line, e.g. "2 region(s), 9 collector error(s) total --
+    suppressed")
 
 Written to --output-dir (one row per account+region / account+region+type /
-resource, across ALL scanned accounts):
+resource / collector-error, across ALL scanned accounts):
   1_region_summary_<timestamp>.csv
   2_resource_type_breakdown_<timestamp>.csv
   3_resource_inventory_<timestamp>.csv
   4_account_findings_summary_<timestamp>.csv
+  5_collector_errors_<timestamp>.csv
 """
 
 import argparse
@@ -100,6 +139,7 @@ import csv
 import os
 import sys
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -107,6 +147,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 try:
     import boto3
+    from botocore.config import Config
     from botocore.exceptions import (
         BotoCoreError,
         ClientError,
@@ -118,6 +159,14 @@ try:
 except ImportError:
     print("ERROR: boto3 is required. Install with: pip install boto3", file=sys.stderr)
     sys.exit(1)
+
+# Every AWS client uses adaptive retries -- if concurrent scanning ever does
+# trigger throttling (Throttling/RequestLimitExceeded/TooManyRequests), the
+# SDK backs off and retries automatically instead of surfacing it as a hard
+# failure. This is the main safety net against "getting blocked by AWS";
+# --max-workers just controls how much concurrency we offer it in the first
+# place.
+RETRY_CONFIG = Config(retries={"max_attempts": 10, "mode": "adaptive"})
 
 try:
     from alive_progress import alive_bar
@@ -148,15 +197,29 @@ class ResourceRecord:
 
 
 @dataclass
+class CollectorError:
+    """A single failed API call, with just enough detail to quantify and
+    troubleshoot restrictive read-only policies (e.g. AWSReadOnlyAccess +
+    an SCP explicit deny) without dumping the full raw exception to STDOUT
+    by default."""
+    region: str
+    collector: str
+    code: str          # short AWS error code, e.g. AccessDenied, UnauthorizedOperation
+    scp_denied: bool    # True if the error text indicates an SCP explicit deny
+    message: str        # full exception text, shown only with --verbose
+
+
+@dataclass
 class RegionResult:
     region: str
     enabled: bool
     resource_count: Optional[int] = None  # None = unknown/error, not "zero"
     resources: List[ResourceRecord] = field(default_factory=list)
-    errors: List[str] = field(default_factory=list)
+    errors: List[CollectorError] = field(default_factory=list)
+    collector_total: int = 0  # how many collectors were attempted in this region
     expected: Optional[bool] = None  # None = user gave no --expected-regions
     finding: str = ""
-    severity: str = "none"  # none|good|ok|info|warn|finding|error
+    severity: str = "none"  # none|good|ok|info|warn|partial|finding|error
 
 
 # --------------------------------------------------------------------------
@@ -189,6 +252,19 @@ def _paginate(client, op_name: str, result_key: str, **kwargs) -> list:
         return items
 
 
+def _classify_error(region: str, collector: str, exc: Exception) -> CollectorError:
+    """Turn a raw exception into a short, quantifiable CollectorError --
+    used to silence noisy STDOUT dumps by default while still surfacing
+    *how many* and *what kind* of permission gaps exist."""
+    code = "Error"
+    if isinstance(exc, ClientError):
+        code = exc.response.get("Error", {}).get("Code", "ClientError")
+    msg = str(exc)
+    scp_denied = "service control policy" in msg.lower()
+    return CollectorError(region=region, collector=collector, code=code,
+                           scp_denied=scp_denied, message=msg)
+
+
 def _tag_name(tags) -> str:
     if not tags:
         return ""
@@ -199,7 +275,7 @@ def _tag_name(tags) -> str:
 
 
 def collect_ec2_instances(session, region, account_id, partition) -> List[ResourceRecord]:
-    ec2 = session.client("ec2", region_name=region)
+    ec2 = session.client("ec2", region_name=region, config=RETRY_CONFIG)
     reservations = _paginate(ec2, "describe_instances", "Reservations")
     out = []
     for r in reservations:
@@ -215,7 +291,7 @@ def collect_ec2_instances(session, region, account_id, partition) -> List[Resour
 
 
 def collect_ebs_volumes(session, region, account_id, partition) -> List[ResourceRecord]:
-    ec2 = session.client("ec2", region_name=region)
+    ec2 = session.client("ec2", region_name=region, config=RETRY_CONFIG)
     volumes = _paginate(ec2, "describe_volumes", "Volumes")
     out = []
     for v in volumes:
@@ -230,7 +306,7 @@ def collect_ebs_volumes(session, region, account_id, partition) -> List[Resource
 
 
 def collect_vpcs(session, region, account_id, partition) -> List[ResourceRecord]:
-    ec2 = session.client("ec2", region_name=region)
+    ec2 = session.client("ec2", region_name=region, config=RETRY_CONFIG)
     vpcs = _paginate(ec2, "describe_vpcs", "Vpcs")
     out = []
     for v in vpcs:
@@ -248,7 +324,7 @@ def collect_vpcs(session, region, account_id, partition) -> List[ResourceRecord]
 
 
 def collect_rds_instances(session, region, account_id, partition) -> List[ResourceRecord]:
-    rds = session.client("rds", region_name=region)
+    rds = session.client("rds", region_name=region, config=RETRY_CONFIG)
     dbs = _paginate(rds, "describe_db_instances", "DBInstances")
     out = []
     for db in dbs:
@@ -263,7 +339,7 @@ def collect_rds_instances(session, region, account_id, partition) -> List[Resour
 
 
 def collect_rds_clusters(session, region, account_id, partition) -> List[ResourceRecord]:
-    rds = session.client("rds", region_name=region)
+    rds = session.client("rds", region_name=region, config=RETRY_CONFIG)
     clusters = _paginate(rds, "describe_db_clusters", "DBClusters")
     out = []
     for c in clusters:
@@ -278,7 +354,7 @@ def collect_rds_clusters(session, region, account_id, partition) -> List[Resourc
 
 
 def collect_lambda_functions(session, region, account_id, partition) -> List[ResourceRecord]:
-    lam = session.client("lambda", region_name=region)
+    lam = session.client("lambda", region_name=region, config=RETRY_CONFIG)
     fns = _paginate(lam, "list_functions", "Functions")
     out = []
     for fn in fns:
@@ -293,7 +369,7 @@ def collect_lambda_functions(session, region, account_id, partition) -> List[Res
 
 
 def collect_elb_classic(session, region, account_id, partition) -> List[ResourceRecord]:
-    elb = session.client("elb", region_name=region)
+    elb = session.client("elb", region_name=region, config=RETRY_CONFIG)
     lbs = _paginate(elb, "describe_load_balancers", "LoadBalancerDescriptions")
     out = []
     for lb in lbs:
@@ -308,7 +384,7 @@ def collect_elb_classic(session, region, account_id, partition) -> List[Resource
 
 
 def collect_elbv2(session, region, account_id, partition) -> List[ResourceRecord]:
-    elbv2 = session.client("elbv2", region_name=region)
+    elbv2 = session.client("elbv2", region_name=region, config=RETRY_CONFIG)
     lbs = _paginate(elbv2, "describe_load_balancers", "LoadBalancers")
     out = []
     for lb in lbs:
@@ -334,16 +410,16 @@ CORE_COLLECTORS = [
 ]
 
 
-def collect_s3_buckets_by_region(session, account_id, partition) -> Tuple[Dict[str, List[ResourceRecord]], List[str]]:
+def collect_s3_buckets_by_region(session, account_id, partition) -> Tuple[Dict[str, List[ResourceRecord]], List[CollectorError]]:
     """S3 is a global service -- list every bucket once, then resolve each
     bucket's actual region so it can be folded into that region's results."""
-    errors = []
+    errors: List[CollectorError] = []
     by_region: Dict[str, List[ResourceRecord]] = defaultdict(list)
     try:
-        s3 = session.client("s3", region_name="us-east-1")
+        s3 = session.client("s3", region_name="us-east-1", config=RETRY_CONFIG)
         resp = s3.list_buckets()
     except (ClientError, BotoCoreError, EndpointConnectionError) as e:
-        errors.append(f"S3 ListBuckets failed: {e}")
+        errors.append(_classify_error("global", "S3 ListBuckets", e))
         return by_region, errors
 
     for b in resp.get("Buckets", []):
@@ -354,7 +430,7 @@ def collect_s3_buckets_by_region(session, account_id, partition) -> Tuple[Dict[s
             if region == "EU":
                 region = "eu-west-1"
         except (ClientError, BotoCoreError, EndpointConnectionError) as e:
-            errors.append(f"S3 GetBucketLocation failed for {name}: {e}")
+            errors.append(_classify_error("global", f"S3 GetBucketLocation ({name})", e))
             region = "unknown"
         by_region[region].append(ResourceRecord(
             resource_type="s3:bucket",
@@ -369,7 +445,7 @@ def collect_tagged_resources(session, region, account_id, partition) -> List[Res
     """Catch-all via the Resource Groups Tagging API -- covers most
     services not explicitly collected above (DynamoDB, SNS, SQS,
     CloudFormation, KMS, ECS/EKS, API Gateway, etc.)."""
-    client = session.client("resourcegroupstaggingapi", region_name=region)
+    client = session.client("resourcegroupstaggingapi", region_name=region, config=RETRY_CONFIG)
     items = _paginate(client, "get_resources", "ResourceTagMappingList", ResourcesPerPage=100)
     out = []
     for item in items:
@@ -407,11 +483,12 @@ def _type_and_id_from_arn(arn: str) -> Tuple[str, str]:
 # --------------------------------------------------------------------------
 
 def scan_region(session, account_id, partition, region, extra_records=None,
-                 skip_tagging_api=False) -> Tuple[List[ResourceRecord], List[str], bool]:
+                 skip_tagging_api=False) -> Tuple[List[ResourceRecord], List[CollectorError], bool, int]:
     seen_arns: Set[str] = set()
     records: List[ResourceRecord] = []
-    errors: List[str] = []
+    errors: List[CollectorError] = []
     any_success = False
+    collector_total = len(CORE_COLLECTORS) + (0 if skip_tagging_api else 1)
 
     def add(rec: ResourceRecord):
         if rec.arn not in seen_arns:
@@ -424,9 +501,9 @@ def scan_region(session, account_id, partition, region, extra_records=None,
                 add(rec)
             any_success = True
         except (ClientError, BotoCoreError, EndpointConnectionError) as e:
-            errors.append(f"{label}: {e}")
+            errors.append(_classify_error(region, label, e))
         except Exception as e:  # defensive -- never let one collector kill the scan
-            errors.append(f"{label}: unexpected error: {e}")
+            errors.append(_classify_error(region, label, e))
 
     if not skip_tagging_api:
         try:
@@ -434,19 +511,19 @@ def scan_region(session, account_id, partition, region, extra_records=None,
                 add(rec)
             any_success = True
         except (ClientError, BotoCoreError, EndpointConnectionError) as e:
-            errors.append(f"Resource Groups Tagging API: {e}")
+            errors.append(_classify_error(region, "Resource Groups Tagging API", e))
         except Exception as e:
-            errors.append(f"Resource Groups Tagging API: unexpected error: {e}")
+            errors.append(_classify_error(region, "Resource Groups Tagging API", e))
 
     for rec in (extra_records or []):
         add(rec)
         any_success = True
 
-    return records, errors, any_success
+    return records, errors, any_success, collector_total
 
 
 def get_account_identity(session, bootstrap_region) -> Tuple[str, str]:
-    sts = session.client("sts", region_name=bootstrap_region)
+    sts = session.client("sts", region_name=bootstrap_region, config=RETRY_CONFIG)
     identity = sts.get_caller_identity()
     arn = identity["Arn"]
     partition = arn.split(":")[1]
@@ -456,7 +533,7 @@ def get_account_identity(session, bootstrap_region) -> Tuple[str, str]:
 def get_all_regions(session, bootstrap_region) -> List[Tuple[str, bool]]:
     """Returns [(region_name, enabled), ...]. A disabled (opt-in-not-enabled)
     region is a GOOD thing -- it can't hold running resources."""
-    ec2 = session.client("ec2", region_name=bootstrap_region)
+    ec2 = session.client("ec2", region_name=bootstrap_region, config=RETRY_CONFIG)
     resp = ec2.describe_regions(AllRegions=True)
     out = []
     for r in resp["Regions"]:
@@ -477,31 +554,54 @@ def classify(region_result: RegionResult, expected_regions: Optional[Set[str]]):
         r.severity = "good"
         return
 
+    # Whether this region is on the documented/expected list is knowable
+    # regardless of whether we could enumerate what's inside it -- an
+    # enabled region outside the expected footprint is itself a finding,
+    # even when permissions block us from confirming what's running there.
+    r.expected = (r.region in expected_regions) if expected_regions is not None else None
+
     if r.resource_count is None:
-        r.expected = (r.region in expected_regions) if expected_regions else None
-        r.finding = "ERROR - could not enumerate (check permissions)"
-        r.severity = "error"
+        # Every collector was denied -- resources are UNKNOWN, not zero.
+        if expected_regions is None:
+            r.finding = (f"ERROR - could not enumerate "
+                         f"({len(r.errors)}/{r.collector_total} collectors denied -- check permissions)")
+            r.severity = "error"
+        elif r.expected:
+            r.finding = (f"Expected region, but resource status UNKNOWN "
+                         f"({len(r.errors)}/{r.collector_total} collectors denied -- check permissions)")
+            r.severity = "error"
+        else:
+            r.finding = (f"FINDING - enabled region NOT expected; resource status UNCONFIRMED "
+                         f"({len(r.errors)}/{r.collector_total} collectors denied) -- a region with "
+                         f"no expected resources should not be enabled at all; MANUAL REVIEW REQUIRED")
+            r.severity = "finding_unconfirmed"
         return
 
     if expected_regions is None:
-        r.expected = None
         r.finding = "In use" if r.resource_count > 0 else "Enabled, no resources found"
         r.severity = "info" if r.resource_count > 0 else "none"
-        return
+    else:
+        if r.expected and r.resource_count > 0:
+            r.finding = "OK - expected region, in use"
+            r.severity = "ok"
+        elif r.expected and r.resource_count == 0:
+            r.finding = "Expected region, but NO resources found"
+            r.severity = "info"
+        elif not r.expected and r.resource_count > 0:
+            r.finding = "FINDING - unexpected resources present"
+            r.severity = "finding"
+        else:  # not expected, zero resources (fully or partially confirmed)
+            r.finding = "FINDING - enabled region not expected, unused (disablement candidate)"
+            r.severity = "warn"
 
-    r.expected = r.region in expected_regions
-    if r.expected and r.resource_count > 0:
-        r.finding = "OK - expected region, in use"
-        r.severity = "ok"
-    elif r.expected and r.resource_count == 0:
-        r.finding = "Expected region, but NO resources found"
-        r.severity = "info"
-    elif not r.expected and r.resource_count > 0:
-        r.finding = "FINDING - unexpected resources present"
-        r.severity = "finding"
-    else:  # not expected, zero resources
-        r.finding = "FINDING - enabled region not expected, unused (disablement candidate)"
-        r.severity = "warn"
+    # Some collectors succeeded (so resource_count is real) but others were
+    # denied -- the count is a MINIMUM, not a confirmed total. Flag this
+    # quantitatively rather than silently under-reporting.
+    if r.errors:
+        r.finding += (f" [INCOMPLETE: {len(r.errors)}/{r.collector_total} collectors denied "
+                       f"-- count is a MINIMUM]")
+        if r.severity in ("good", "ok", "info", "none"):
+            r.severity = "partial"
 
 
 # --------------------------------------------------------------------------
@@ -516,27 +616,43 @@ def compute_account_metrics(region_results: List[RegionResult], expected_regions
             m["disabled_regions"] += 1
             continue
         m["enabled_regions"] += 1
+
         if r.resource_count is None:
             m["regions_with_errors"] += 1
-            continue
-        if r.resource_count > 0:
-            m["enabled_regions_with_resources"] += 1
+            m["total_collector_errors"] += len(r.errors)
         else:
-            m["enabled_regions_without_resources"] += 1
-
-        if expected_regions is not None:
-            if r.expected:
-                m["expected_regions_with_data"] += 1
-                if r.resource_count > 0:
-                    m["expected_regions_with_resources"] += 1
-                else:
-                    m["expected_regions_without_resources"] += 1
+            if r.resource_count > 0:
+                m["enabled_regions_with_resources"] += 1
             else:
-                m["enabled_regions_not_expected"] += 1
-                if r.resource_count > 0:
-                    m["unexpected_regions_with_resources"] += 1  # KEY FINDING
-                else:
-                    m["unused_enabled_regions_not_expected"] += 1  # KEY FINDING
+                m["enabled_regions_without_resources"] += 1
+            if r.errors:
+                m["regions_with_partial_data"] += 1
+                m["total_collector_errors"] += len(r.errors)
+
+        if expected_regions is None:
+            continue
+
+        if r.expected:
+            if r.resource_count is None:
+                m["expected_regions_unknown"] += 1
+            elif r.resource_count > 0:
+                m["expected_regions_with_resources"] += 1
+            else:
+                m["expected_regions_without_resources"] += 1
+        else:
+            # An enabled region outside the expected footprint is a FINDING
+            # on its own -- always counted here, even when we couldn't
+            # enumerate what (if anything) is running in it.
+            m["enabled_regions_not_expected"] += 1
+            if r.resource_count is not None and r.resource_count > 0:
+                m["unexpected_regions_with_resources"] += 1  # KEY FINDING -- confirmed
+            elif r.resource_count == 0 and not r.errors:
+                m["unused_enabled_regions_not_expected"] += 1  # KEY FINDING -- confirmed unused
+            else:
+                # resource_count is None, or 0-but-only-a-floor (some
+                # collectors denied) -- we genuinely don't know if it's
+                # empty. Still a finding: it shouldn't be enabled at all.
+                m["unexpected_regions_unconfirmed"] += 1  # KEY FINDING -- inconclusive
     return m
 
 
@@ -591,6 +707,20 @@ def parse_args():
                          "(only the explicitly-coded resource types will be counted). "
                          "Use this if the account lacks tag:GetResources permission.")
     p.add_argument("--no-color", action="store_true", help="Disable colored/highlighted STDOUT output.")
+    p.add_argument("--verbose", "-v", action="store_true",
+                    help="Print the full raw error for every failed collector call (permission "
+                         "denials, SCP explicit denies, etc.) as it happens. Without this flag, "
+                         "those errors are silenced on STDOUT and instead surfaced as quantified "
+                         "counts in the region summary table/CSV and in "
+                         "5_collector_errors_<timestamp>.csv.")
+    p.add_argument("--max-workers", type=int, default=8, metavar="N",
+                    help="Max region-scans to run concurrently, pooled across every profile "
+                         "being audited (default: 8). Each worker still calls the ~9 collectors "
+                         "for its region one at a time, so this bounds total concurrent AWS API "
+                         "calls, not multiplies against region/profile counts. Every client also "
+                         "retries with adaptive backoff on throttling, so raising this is safe to "
+                         "try if scans still feel slow; lower it if you actually get throttled. "
+                         "Use --max-workers 1 to scan strictly sequentially (old behavior).")
     return p.parse_args()
 
 
@@ -630,8 +760,10 @@ SEVERITY_STYLE = {
     "ok": "green",
     "info": "cyan",
     "none": "white",
+    "partial": "bold yellow",
     "warn": "yellow",
     "finding": "bold red",
+    "finding_unconfirmed": "red",  # enabled + unexpected, but couldn't confirm resources either way
     "error": "bold magenta",
 }
 
@@ -644,6 +776,7 @@ def render_region_table(console: Console, profile: str, account_id: str,
     table.add_column("Region Status", justify="center")
     table.add_column("Expected?", justify="center")
     table.add_column("Resource Count", justify="right")
+    table.add_column("Collector Errors", justify="center")
     table.add_column("Finding")
 
     for r in region_results:
@@ -655,8 +788,20 @@ def render_region_table(console: Console, profile: str, account_id: str,
             expected_str = "?"
         else:
             expected_str = "Yes" if r.expected else "No"
-        count_str = "-" if r.resource_count is None else str(r.resource_count)
-        table.add_row(r.region, region_status, expected_str, count_str, r.finding, style=style)
+        if r.resource_count is None:
+            count_str = "-"
+        elif r.errors:
+            count_str = f">={r.resource_count}"  # errors present -> count is a floor, not exact
+        else:
+            count_str = str(r.resource_count)
+        if not r.enabled:
+            errors_str = "n/a"
+        elif r.errors:
+            errors_str = f"{len(r.errors)}/{r.collector_total} denied"
+        else:
+            errors_str = "-"
+        table.add_row(r.region, region_status, expected_str, count_str, errors_str,
+                       r.finding, style=style)
 
     console.print(table)
 
@@ -669,19 +814,37 @@ def render_findings_panel(console: Console, profile: str, account_id: str, m: di
         f"Enabled Regions:                    {m.get('enabled_regions', 0)}",
         f"  - Enabled Regions With Resources: {m.get('enabled_regions_with_resources', 0)}",
         f"  - Enabled Regions, No Resources:  {m.get('enabled_regions_without_resources', 0)}",
-        f"Regions That Errored (unknown):     {m.get('regions_with_errors', 0)}",
+        f"Regions That Errored (fully unknown): {m.get('regions_with_errors', 0)}",
     ]
+    if m.get("regions_with_partial_data", 0) or m.get("total_collector_errors", 0):
+        lines.append(
+            f"Regions With INCOMPLETE Data (some collectors denied): "
+            f"{m.get('regions_with_partial_data', 0)}  "
+            f"(total collector errors: {m.get('total_collector_errors', 0)} -- "
+            f"see collector_errors CSV / rerun with --verbose)"
+        )
     if expected_regions is not None:
         lines += [
             "",
-            f"Expected Regions With Resources:           {m.get('expected_regions_with_resources', 0)}",
-            f"Expected Regions With NO Resources:        {m.get('expected_regions_without_resources', 0)}",
-            f"Number of Enabled Regions Not Expected:    {m.get('enabled_regions_not_expected', 0)}",
-            f"  -> Unexpected Regions WITH Resources (FINDING):        "
+            f"Expected Regions With Resources:                    {m.get('expected_regions_with_resources', 0)}",
+            f"Expected Regions With NO Resources:                 {m.get('expected_regions_without_resources', 0)}",
+            f"Expected Regions - Resource Status Unknown:         {m.get('expected_regions_unknown', 0)}",
+            "",
+            f"Number of Enabled Regions Not Expected (FINDING):   {m.get('enabled_regions_not_expected', 0)}",
+            f"  -> Confirmed: Unexpected Resources Present:              "
             f"{m.get('unexpected_regions_with_resources', 0)}",
-            f"  -> Unused Enabled Regions Not Expected (FINDING):      "
+            f"  -> Confirmed: Unused (safe disablement candidate):       "
             f"{m.get('unused_enabled_regions_not_expected', 0)}",
+            f"  -> UNCONFIRMED (denied permissions -- manual review):    "
+            f"{m.get('unexpected_regions_unconfirmed', 0)}",
         ]
+        if m.get("unexpected_regions_unconfirmed", 0):
+            lines.append(
+                "\nNote: 'UNCONFIRMED' regions are enabled and NOT on the expected-regions "
+                "list -- that alone is a finding -- but collector denials mean we could not "
+                "verify whether they actually hold resources. Treat as an open item, not a "
+                "clean bill of health."
+            )
     else:
         lines.append("\n(no --expected-regions supplied -- nothing flagged as unexpected)")
 
@@ -693,7 +856,8 @@ def render_findings_panel(console: Console, profile: str, account_id: str, m: di
 # CSV writers
 # --------------------------------------------------------------------------
 
-def write_csvs(output_dir: Path, region_rows, type_rows, inventory_rows, account_rows, timestamp: str):
+def write_csvs(output_dir: Path, region_rows, type_rows, inventory_rows, account_rows,
+                error_rows, timestamp: str):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     def _write(filename, header, rows):
@@ -706,7 +870,8 @@ def write_csvs(output_dir: Path, region_rows, type_rows, inventory_rows, account
 
     p1 = _write(f"1_region_summary_{timestamp}.csv",
                 ["Profile", "AccountId", "Region", "RegionStatus", "Expected",
-                 "ResourceCount", "Finding", "Severity"],
+                 "ResourceCount", "CountIsMinimum", "CollectorErrors", "CollectorsAttempted",
+                 "Finding", "Severity"],
                 region_rows)
     p2 = _write(f"2_resource_type_breakdown_{timestamp}.csv",
                 ["Profile", "AccountId", "Region", "ResourceType", "Count",
@@ -720,17 +885,39 @@ def write_csvs(output_dir: Path, region_rows, type_rows, inventory_rows, account
                 ["Profile", "AccountId", "TotalRegionsChecked", "DisabledRegions",
                  "EnabledRegions", "EnabledRegionsWithResources",
                  "EnabledRegionsWithoutResources", "RegionsWithErrors",
+                 "RegionsWithPartialData", "TotalCollectorErrors",
                  "ExpectedRegionsProvided", "ExpectedRegionsWithResources",
-                 "ExpectedRegionsWithoutResources", "EnabledRegionsNotExpected",
+                 "ExpectedRegionsWithoutResources", "ExpectedRegionsResourceStatusUnknown",
+                 "EnabledRegionsNotExpected_FINDING",
                  "UnexpectedRegionsWithResources_FINDING",
-                 "UnusedEnabledRegionsNotExpected_FINDING"],
+                 "UnusedEnabledRegionsNotExpected_FINDING",
+                 "UnexpectedRegionsUnconfirmed_FINDING"],
                 account_rows)
-    return [p1, p2, p3, p4]
+    p5 = _write(f"5_collector_errors_{timestamp}.csv",
+                ["Profile", "AccountId", "Region", "Collector", "ErrorCode",
+                 "SCPExplicitDeny", "Message"],
+                error_rows)
+    return [p1, p2, p3, p4, p5]
 
 
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
+
+def _scan_region_worker(profile: str, account_id: str, partition: str, region_name: str,
+                         extra_records, skip_tagging_api: bool):
+    """Runs in a worker thread. Creates its OWN boto3.Session rather than
+    sharing one across threads -- Session objects (unlike Client objects)
+    are not documented as thread-safe, and this keeps credential
+    resolution/refresh fully isolated per thread regardless of how many
+    regions or profiles are being scanned concurrently."""
+    session = boto3.Session(profile_name=profile)
+    records, errors, any_success, collector_total = scan_region(
+        session, account_id, partition, region_name,
+        extra_records=extra_records, skip_tagging_api=skip_tagging_api,
+    )
+    return profile, region_name, records, errors, any_success, collector_total
+
 
 def main():
     args = parse_args()
@@ -747,9 +934,15 @@ def main():
     csv_type_rows = []
     csv_inventory_rows = []
     csv_account_rows = []
+    csv_error_rows = []
 
+    # ---- Phase 1: sequential, cheap account/region discovery per profile ----
+    # STS + DescribeRegions + S3 listing are each a handful of calls, so this
+    # stays sequential and simple; the real cost -- collector calls fanned
+    # out across every enabled region -- is what gets parallelized below.
+    profile_ctxs = []
     for profile in profiles:
-        console.rule(f"[bold]Profile: {profile}[/bold]")
+        console.print(f"[bold]Profile: {profile}[/bold] -- discovering account & regions...")
         try:
             session = boto3.Session(profile_name=profile)
         except ProfileNotFound as e:
@@ -780,40 +973,90 @@ def main():
         # S3 is global -- resolve buckets to their real region once, up front.
         s3_by_region, s3_errors = collect_s3_buckets_by_region(session, account_id, partition)
 
-        region_results: List[RegionResult] = []
-        enabled_regions = [name for name, enabled in regions if enabled]
+        region_results_map: Dict[str, RegionResult] = {}
+        for region_name, enabled in regions:
+            if not enabled:
+                region_results_map[region_name] = RegionResult(region=region_name, enabled=False)
 
-        with alive_bar(len(enabled_regions), title=f"{profile}", enrich_print=False) as bar:
-            for region_name, enabled in regions:
-                if not enabled:
-                    region_results.append(RegionResult(region=region_name, enabled=False))
-                    continue
-                bar.text = f"scanning {region_name}"
-                extra = s3_by_region.get(region_name, [])
-                records, errors, any_success = scan_region(
-                    session, account_id, partition, region_name,
-                    extra_records=extra, skip_tagging_api=args.no_tagging_api,
-                )
-                rr = RegionResult(region=region_name, enabled=True, resources=records,
-                                   errors=errors)
-                rr.resource_count = len(records) if any_success else None
-                region_results.append(rr)
-                bar()
+        profile_ctxs.append({
+            "profile": profile, "account_id": account_id, "partition": partition,
+            "regions": regions, "s3_by_region": s3_by_region, "s3_errors": s3_errors,
+            "region_results_map": region_results_map,
+        })
 
+    # ---- Phase 2: build one flat job list across EVERY profile's enabled regions ----
+    jobs = []
+    for ctx in profile_ctxs:
+        for region_name, enabled in ctx["regions"]:
+            if enabled:
+                jobs.append((ctx["profile"], ctx["account_id"], ctx["partition"], region_name,
+                             ctx["s3_by_region"].get(region_name, []), args.no_tagging_api))
+
+    # ---- Phase 3: scan every (profile, region) job through one shared pool ----
+    # One shared executor + one shared progress bar across ALL profiles caps
+    # total concurrent AWS calls at --max-workers regardless of how many
+    # accounts are being audited, rather than multiplying a per-account pool
+    # by a per-region pool. as_completed() is consumed here in the main
+    # thread, so bar updates never need a lock.
+    ctx_by_profile = {ctx["profile"]: ctx for ctx in profile_ctxs}
+    if jobs:
+        with alive_bar(len(jobs), title=f"scanning {len(jobs)} region(s) across "
+                                         f"{len(profile_ctxs)} profile(s)", enrich_print=False) as bar:
+            with ThreadPoolExecutor(max_workers=max(1, args.max_workers)) as pool:
+                futures = [pool.submit(_scan_region_worker, *job) for job in jobs]
+                for future in as_completed(futures):
+                    profile, region_name, records, errors, any_success, collector_total = future.result()
+                    rr = RegionResult(region=region_name, enabled=True, resources=records,
+                                       errors=errors, collector_total=collector_total)
+                    rr.resource_count = len(records) if any_success else None
+                    ctx_by_profile[profile]["region_results_map"][region_name] = rr
+                    bar.text = f"{profile}/{region_name} done"
+                    bar()
+
+    # ---- Phase 4: sequential rendering + CSV accumulation, one profile at a time ----
+    for ctx in profile_ctxs:
+        profile = ctx["profile"]
+        account_id = ctx["account_id"]
+        s3_errors = ctx["s3_errors"]
+        region_results = [ctx["region_results_map"][name] for name, _ in ctx["regions"]]
+
+        console.rule(f"[bold]Profile: {profile}[/bold]")
+
+        for e in s3_errors:
+            csv_error_rows.append([
+                profile, account_id, e.region, e.collector, e.code,
+                "Yes" if e.scp_denied else "No", e.message,
+            ])
+
+        # S3 bucket-location lookups happen once, globally, before the
+        # per-region loop -- surface them the same quiet-by-default way.
         if s3_errors:
-            for e in s3_errors:
-                console.print(f"[yellow]S3 warning ({profile}): {e}[/yellow]")
+            if args.verbose:
+                for e in s3_errors:
+                    console.print(f"[yellow]S3 warning ({profile}) [{e.code}]: {e.message}[/yellow]")
+            else:
+                console.print(f"[yellow]{profile}: {len(s3_errors)} S3 bucket-location lookup "
+                               f"error(s) (bucketed as 'unknown' region) -- rerun with --verbose "
+                               f"or see 5_collector_errors CSV for detail.[/yellow]")
 
         for r in region_results:
             classify(r, expected_regions)
 
         render_region_table(console, profile, account_id, region_results, expected_regions)
 
-        for r in region_results:
-            if r.errors:
-                console.print(f"[dim]  {r.region} collector warnings: "
-                               f"{'; '.join(r.errors[:3])}"
-                               f"{' ...' if len(r.errors) > 3 else ''}[/dim]")
+        regions_with_errors = [r for r in region_results if r.errors]
+        if regions_with_errors:
+            if args.verbose:
+                for r in regions_with_errors:
+                    for e in r.errors:
+                        scp_note = " (SCP explicit deny)" if e.scp_denied else ""
+                        console.print(f"[dim]  {r.region} -- {e.collector} [{e.code}]{scp_note}: "
+                                       f"{e.message}[/dim]")
+            else:
+                total_errs = sum(len(r.errors) for r in regions_with_errors)
+                console.print(f"[dim]{len(regions_with_errors)} region(s), {total_errs} collector "
+                               f"error(s) total -- suppressed (see Collector Errors column above, "
+                               f"5_collector_errors CSV, or rerun with --verbose).[/dim]")
 
         metrics = compute_account_metrics(region_results, expected_regions)
         render_findings_panel(console, profile, account_id, metrics, expected_regions)
@@ -826,8 +1069,15 @@ def main():
             csv_region_rows.append([
                 profile, account_id, r.region, "Enabled" if r.enabled else "Disabled",
                 expected_str, r.resource_count if r.resource_count is not None else "",
+                "Yes" if (r.errors and r.resource_count is not None) else "No",
+                len(r.errors), r.collector_total if r.enabled else "",
                 r.finding, r.severity,
             ])
+            for e in r.errors:
+                csv_error_rows.append([
+                    profile, account_id, e.region, e.collector, e.code,
+                    "Yes" if e.scp_denied else "No", e.message,
+                ])
 
             type_counts = Counter(res.resource_type for res in r.resources)
             for rtype, count in sorted(type_counts.items()):
@@ -851,16 +1101,20 @@ def main():
             metrics.get("enabled_regions_with_resources", 0),
             metrics.get("enabled_regions_without_resources", 0),
             metrics.get("regions_with_errors", 0),
+            metrics.get("regions_with_partial_data", 0),
+            metrics.get("total_collector_errors", 0),
             "Yes" if expected_regions is not None else "No",
             metrics.get("expected_regions_with_resources", 0) if expected_regions is not None else "",
             metrics.get("expected_regions_without_resources", 0) if expected_regions is not None else "",
+            metrics.get("expected_regions_unknown", 0) if expected_regions is not None else "",
             metrics.get("enabled_regions_not_expected", 0) if expected_regions is not None else "",
             metrics.get("unexpected_regions_with_resources", 0) if expected_regions is not None else "",
             metrics.get("unused_enabled_regions_not_expected", 0) if expected_regions is not None else "",
+            metrics.get("unexpected_regions_unconfirmed", 0) if expected_regions is not None else "",
         ])
 
     paths = write_csvs(output_dir, csv_region_rows, csv_type_rows, csv_inventory_rows,
-                        csv_account_rows, timestamp)
+                        csv_account_rows, csv_error_rows, timestamp)
 
     console.rule("[bold]Done[/bold]")
     console.print(f"CSV output written to: [bold]{output_dir}[/bold]")
