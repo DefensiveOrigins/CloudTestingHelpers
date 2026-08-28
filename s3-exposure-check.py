@@ -774,10 +774,37 @@ def process_profile(profile, args, csv_writer, logger):
 
 
 # --------------------------------------------------------------------------
-# STDOUT summary
+# STDOUT tables + account-level summary
 # --------------------------------------------------------------------------
 
-def print_summary_table():
+ACCOUNT_SUMMARY_FIELDNAMES = [
+    "aws_account_id",
+    "profiles",
+    "total_buckets",
+    "buckets_with_public_index",
+    "buckets_with_public_file_access",
+    "buckets_with_unencrypted_http_access",
+    "buckets_unable_to_verify",
+]
+
+
+def _print_table(headers, table_rows):
+    if HAVE_TABULATE:
+        print(tabulate(table_rows, headers=headers, tablefmt="grid"))
+        return
+    col_widths = [max(len(str(row[i])) for row in ([headers] + table_rows)) for i in range(len(headers))]
+
+    def fmt_row(cells):
+        return " | ".join(str(c).ljust(col_widths[i]) for i, c in enumerate(cells))
+
+    print(fmt_row(headers))
+    print("-+-".join("-" * w for w in col_widths))
+    for row in table_rows:
+        print(fmt_row(row))
+
+
+def print_detailed_results_table():
+    """Per-bucket detail: one row per bucket assessed, in the order tested."""
     if not SUMMARY_ROWS:
         print("\nNo buckets were assessed.")
         return
@@ -797,18 +824,9 @@ def print_summary_table():
         ])
 
     print("\n" + "=" * 100)
-    print("S3 PUBLIC EXPOSURE ASSESSMENT -- SUMMARY")
+    print("S3 PUBLIC EXPOSURE ASSESSMENT -- DETAILED RESULTS")
     print("=" * 100)
-    if HAVE_TABULATE:
-        print(tabulate(table_rows, headers=headers, tablefmt="grid"))
-    else:
-        col_widths = [max(len(str(row[i])) for row in ([headers] + table_rows)) for i in range(len(headers))]
-        def fmt_row(cells):
-            return " | ".join(str(c).ljust(col_widths[i]) for i, c in enumerate(cells))
-        print(fmt_row(headers))
-        print("-+-".join("-" * w for w in col_widths))
-        for row in table_rows:
-            print(fmt_row(row))
+    _print_table(headers, table_rows)
 
     total = len(SUMMARY_ROWS)
     critical = sum(1 for r in SUMMARY_ROWS if r["risk_level"].startswith("CRITICAL"))
@@ -820,6 +838,76 @@ def print_summary_table():
     print(f"  HIGH (unencrypted transport exposure): {high}")
     print(f"  UNKNOWN (unable to verify): {unknown}")
     print(f"  OK (no public access detected): {ok}")
+
+
+def build_account_summary():
+    """Aggregate the per-bucket SUMMARY_ROWS into one row per AWS account."""
+    accounts = {}
+    order = []
+    for r in SUMMARY_ROWS:
+        acct = r.get("aws_account_id") or "Unknown"
+        if acct not in accounts:
+            accounts[acct] = {
+                "aws_account_id": acct,
+                "profiles": set(),
+                "total_buckets": 0,
+                "buckets_with_public_index": 0,
+                "buckets_with_public_file_access": 0,
+                "buckets_with_unencrypted_http_access": 0,
+                "buckets_unable_to_verify": 0,
+            }
+            order.append(acct)
+        entry = accounts[acct]
+        entry["profiles"].add(r.get("profile", "") or "")
+        entry["total_buckets"] += 1
+        if r.get("index_publicly_listable_anonymous") is True:
+            entry["buckets_with_public_index"] += 1
+        if r.get("file_public_no_auth_https") is True:
+            entry["buckets_with_public_file_access"] += 1
+        if r.get("file_public_http_unencrypted") is True:
+            entry["buckets_with_unencrypted_http_access"] += 1
+        if str(r.get("risk_level", "")).startswith("UNKNOWN"):
+            entry["buckets_unable_to_verify"] += 1
+
+    rows = []
+    for acct in order:
+        entry = dict(accounts[acct])
+        entry["profiles"] = ", ".join(sorted(p for p in entry["profiles"] if p))
+        rows.append(entry)
+    return rows
+
+
+def print_account_summary_table(account_rows):
+    print("\n" + "=" * 100)
+    print("S3 PUBLIC EXPOSURE ASSESSMENT -- SUMMARY BY AWS ACCOUNT")
+    print("=" * 100)
+    if not account_rows:
+        print("No accounts were assessed.")
+        return
+
+    headers = ["AWS Account", "Profile(s)", "Total\nBuckets", "Public\nIndex",
+               "Public\nFile Access", "Unencrypted\nHTTP Access", "Unable to\nVerify"]
+    table_rows = [
+        [
+            a["aws_account_id"],
+            a["profiles"],
+            a["total_buckets"],
+            a["buckets_with_public_index"],
+            a["buckets_with_public_file_access"],
+            a["buckets_with_unencrypted_http_access"],
+            a["buckets_unable_to_verify"],
+        ]
+        for a in account_rows
+    ]
+    _print_table(headers, table_rows)
+
+
+def write_account_summary_csv(account_rows, path):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=ACCOUNT_SUMMARY_FIELDNAMES)
+        writer.writeheader()
+        for a in account_rows:
+            writer.writerow(a)
 
 
 # --------------------------------------------------------------------------
@@ -879,6 +967,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = out_dir / f"s3_assessment_{ts}.csv"
+    summary_csv_path = out_dir / f"s3_assessment_summary_{ts}.csv"
     log_path = out_dir / f"s3_assessment_{ts}.log"
 
     logger = build_logger(log_path, args.verbose)
@@ -888,9 +977,13 @@ def main():
         if _csv_file_handle:
             _csv_file_handle.flush()
             _csv_file_handle.close()
-        print_summary_table()
-        print(f"\nPartial CSV: {csv_path}")
-        print(f"Log file:    {log_path}")
+        print_detailed_results_table()
+        account_rows = build_account_summary()
+        print_account_summary_table(account_rows)
+        write_account_summary_csv(account_rows, summary_csv_path)
+        print(f"\nPartial detailed CSV: {csv_path}")
+        print(f"Partial summary CSV:  {summary_csv_path}")
+        print(f"Log file:             {log_path}")
         sys.exit(130)
 
     signal.signal(signal.SIGINT, _handle_sigint)
@@ -898,8 +991,9 @@ def main():
     logger.info(f"S3 Public Exposure Assessment v{SCRIPT_VERSION} starting")
     logger.info(f"Run parameters: {vars(args)}")
     print(f"S3 Public Exposure Assessment v{SCRIPT_VERSION}")
-    print(f"Log file: {log_path}")
-    print(f"CSV file: {csv_path}\n")
+    print(f"Log file:         {log_path}")
+    print(f"Detailed CSV:     {csv_path}")
+    print(f"Summary CSV:      {summary_csv_path}\n")
 
     if args.all_profiles:
         profiles = get_profiles_from_credentials_file(Path(args.credentials_file), logger)
@@ -919,8 +1013,13 @@ def main():
             process_profile(profile, args, writer, logger)
 
     logger.info("All profiles processed.")
-    print_summary_table()
+    print_detailed_results_table()
+    account_rows = build_account_summary()
+    print_account_summary_table(account_rows)
+    write_account_summary_csv(account_rows, summary_csv_path)
+
     print(f"\nDetailed results: {csv_path}")
+    print(f"Account summary:  {summary_csv_path}")
     print(f"Full log:         {log_path}")
 
 
