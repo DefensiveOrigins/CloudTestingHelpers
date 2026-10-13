@@ -135,5 +135,33 @@ Merges and summarizes multiple per-account LambdaScanner AWS reports into a sing
 
     python3 MergeLambdaScannerReports.py ./lambdascanner-reports
     python3 MergeLambdaScannerReports.py ./lambdascanner-reports -o ./master-report
+---
+
+### sa_exposure_check.py
+
+Empirically validates public exposure of Azure Storage containers/blobs (and other storage services) in one or more subscriptions. The script combines authenticated Azure CLI queries with unauthenticated HTTP(S) requests to confirm what an internet user could actually access.
+
+#### Usage
+
+    python3 sa_exposure_check.py --subscription <id-or-name>
+    python3 sa_exposure_check.py --all-subscriptions
+
+Optional flags include `--output-dir` (defaults to current directory), `--timeout`, `--threads`, `--services` (comma-separated: blobs,files,queues,tables,adls), and `--verbose` for debug output.
+
+#### Requirements
+
+- Azure CLI installed and logged in (`az login`, device code login supported)
+- Python 3
+- `requests` Python package (`pip install requests`)
+
+#### Outputs
+
+- `<output-dir>/sa_assessment_<timestamp>.csv` — detailed per-container/share/queue rows
+- `<output-dir>/sa_assessment_summary_<timestamp>.csv` — per-account summary counts
+
+#### Example
+
+    python3 sa_exposure_check.py --subscription my-subscription --output-dir ./out --services blobs,files --threads 8
+
 
 
